@@ -3,11 +3,23 @@ mod auth;
 
 use anyhow::{Context, Result, bail};
 
-const USAGE: &str = "usage: spotui <login|whoami|devices|now|play [uri]|pause|next|prev|volume <0-100>|transfer <device name>>";
+const USAGE: &str = "usage: spotui <login|whoami|devices|now|play [uri]|pause|next|prev|volume <0-100>|transfer <device name>|search <query>|queue <uri>>";
 
 fn format_ms(ms: u64) -> String {
     let secs = ms / 1000;
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+fn format_track(number: usize, track: &api::Track) -> String {
+    let artists: Vec<&str> = track.artists.iter().map(|a| a.name.as_str()).collect();
+    format!(
+        "{number:>2}. {} - {} ({}) {}\n    {}",
+        track.name,
+        artists.join(", "),
+        track.album.name,
+        format_ms(track.duration_ms),
+        track.uri
+    )
 }
 
 fn describe(playback: Option<api::Playback>) -> String {
@@ -47,6 +59,7 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_default();
     let arg = args.next();
+    let rest: Vec<String> = args.collect();
     let config = auth::Config::load()?;
 
     if command == "login" {
@@ -54,7 +67,17 @@ async fn main() -> Result<()> {
     }
     if !matches!(
         command.as_str(),
-        "whoami" | "devices" | "now" | "play" | "pause" | "next" | "prev" | "volume" | "transfer"
+        "whoami"
+            | "devices"
+            | "now"
+            | "play"
+            | "pause"
+            | "next"
+            | "prev"
+            | "volume"
+            | "transfer"
+            | "search"
+            | "queue"
     ) {
         bail!("{USAGE}");
     }
@@ -80,6 +103,23 @@ async fn main() -> Result<()> {
             }
         }
         "now" => println!("{}", describe(api.playback().await?)),
+        "search" => {
+            let query = arg.into_iter().chain(rest).collect::<Vec<_>>().join(" ");
+            if query.is_empty() {
+                bail!("search takes a query, e.g. `spotui search daft punk`");
+            }
+            let tracks = api.search_tracks(&query, 0).await?;
+            if tracks.is_empty() {
+                println!("No tracks found.");
+            }
+            for (i, track) in tracks.iter().enumerate() {
+                println!("{}", format_track(i + 1, track));
+            }
+        }
+        "queue" => {
+            let uri = arg.context("queue takes a track URI, e.g. from `spotui search`")?;
+            api.queue(&uri).await?;
+        }
         "play" => api.play(arg.as_deref()).await?,
         "pause" => api.pause().await?,
         "next" => api.next().await?,
@@ -147,6 +187,23 @@ mod tests {
         assert_eq!(
             describe(Some(p)),
             "Playing: Song - A, B [1:23/3:45] on spotifyd (40%)"
+        );
+    }
+
+    #[test]
+    fn format_track_shows_artists_album_length_and_uri() {
+        let track = api::Track {
+            uri: "spotify:track:abc".into(),
+            name: "Get Lucky".into(),
+            duration_ms: 369_000,
+            artists: vec![Artist {
+                name: "Daft Punk".into(),
+            }],
+            album: api::Album { name: "RAM".into() },
+        };
+        assert_eq!(
+            format_track(1, &track),
+            " 1. Get Lucky - Daft Punk (RAM) 6:09\n    spotify:track:abc"
         );
     }
 

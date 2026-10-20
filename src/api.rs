@@ -49,6 +49,30 @@ pub struct Playback {
     pub item: Option<Item>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct Album {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Track {
+    pub uri: String,
+    pub name: String,
+    pub duration_ms: u64,
+    pub artists: Vec<Artist>,
+    pub album: Album,
+}
+
+#[derive(Deserialize)]
+struct SearchResponse {
+    tracks: SearchTracks,
+}
+
+#[derive(Deserialize)]
+struct SearchTracks {
+    items: Vec<Track>,
+}
+
 /// Request body for `PUT /me/player/play`: single tracks and episodes are
 /// played by `uris`, anything else (album, playlist, artist) as a `context_uri`.
 fn play_body(uri: &str) -> Value {
@@ -162,6 +186,26 @@ impl Api {
     pub async fn set_volume(&self, percent: u8) -> Result<()> {
         let query = [("volume_percent", percent.to_string())];
         self.send(Method::PUT, "/me/player/volume", &query, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Track search. Spotify caps `limit` at 10 for Development Mode apps.
+    pub async fn search_tracks(&self, query: &str, offset: u32) -> Result<Vec<Track>> {
+        let params = [
+            ("q", query.to_string()),
+            ("type", "track".to_string()),
+            ("limit", "10".to_string()),
+            ("offset", offset.to_string()),
+        ];
+        let resp = self.send(Method::GET, "/search", &params, None).await?;
+        Ok(resp.json::<SearchResponse>().await?.tracks.items)
+    }
+
+    /// Appends a track or episode URI to the playback queue.
+    pub async fn queue(&self, uri: &str) -> Result<()> {
+        let params = [("uri", uri.to_string())];
+        self.send(Method::POST, "/me/player/queue", &params, None)
             .await?;
         Ok(())
     }
@@ -307,6 +351,39 @@ mod tests {
         assert!(raw.starts_with("PUT /me/player "), "{raw}");
         assert!(
             raw.ends_with(r#"{"device_ids":["dev1"],"play":false}"#),
+            "{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_sends_encoded_query_and_parses_tracks() {
+        let body = r#"{"tracks":{"href":"x","total":1,"items":[
+            {"uri":"spotify:track:abc","name":"Get Lucky","duration_ms":369000,
+             "artists":[{"name":"Daft Punk"}],"album":{"name":"RAM","id":"a1"},"is_local":false}]}}"#;
+        let (api, request) = serve_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let tracks = api.search_tracks("daft punk & co", 10).await.unwrap();
+        let raw = request.await.unwrap();
+        let line = raw.lines().next().unwrap();
+        assert!(
+            line.starts_with("GET /search?q=daft+punk+%26+co&type=track&limit=10&offset=10 "),
+            "{line}"
+        );
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].uri, "spotify:track:abc");
+        assert_eq!(tracks[0].album.name, "RAM");
+    }
+
+    #[tokio::test]
+    async fn queue_sends_uri_in_query_with_post() {
+        let (api, request) = serve_once(NO_CONTENT).await;
+        api.queue("spotify:track:abc").await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(
+            raw.starts_with("POST /me/player/queue?uri=spotify%3Atrack%3Aabc "),
             "{raw}"
         );
     }
