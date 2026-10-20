@@ -14,7 +14,8 @@ use tokio::net::TcpListener;
 const AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const SCOPES: &str = "user-read-playback-state user-modify-playback-state \
-                      user-read-currently-playing user-library-read playlist-read-private";
+                      user-read-currently-playing user-library-read playlist-read-private \
+                      user-library-modify playlist-modify-public playlist-modify-private";
 const UNRESERVED: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
 /// Refresh this many seconds before the access token actually expires.
 const EXPIRY_MARGIN_SECS: u64 = 60;

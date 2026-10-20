@@ -1,12 +1,13 @@
 //! TUI state and key handling. No terminal or network access lives here, so
 //! everything in this file is covered by plain unit tests.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 
-use crate::api::{Device, Page, Playback, Playlist, Track};
+use crate::api::{Count, Device, Page, Playback, Playlist, Track};
 
 const VOLUME_STEP: u8 = 5;
 /// Tracks sent in one `uris` play request when starting from Liked Songs.
@@ -17,6 +18,11 @@ pub const MENU: [&str; 3] = ["Search", "Liked Songs", "Playlists"];
 
 const NOT_OWNED: &str = "Spotify only lets this app list playlists you own or collaborate on. \
                          Press P to play it instead.";
+
+/// Only tracks and episodes can be liked or added to a playlist, not local files.
+fn is_likeable(uri: &str) -> bool {
+    uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:")
+}
 
 /// Something the key handler wants done; the runtime performs it.
 #[derive(Debug, PartialEq)]
@@ -49,11 +55,35 @@ pub enum Action {
         id: String,
         offset: u32,
     },
+    CheckLiked(Vec<String>),
+    SetLiked {
+        uri: String,
+        liked: bool,
+        label: String,
+    },
+    CreatePlaylist {
+        name: String,
+        uri: String,
+        label: String,
+    },
+    AddToPlaylist {
+        playlist_id: String,
+        playlist_name: String,
+        uri: String,
+        label: String,
+    },
+    RemoveFromPlaylist {
+        playlist_id: String,
+        playlist_name: String,
+        uri: String,
+        label: String,
+    },
 }
 
 /// Results of background work, delivered back to the event loop.
 pub enum Msg {
     Key(KeyEvent),
+    Me(Result<String, String>),
     Playback(Result<Option<Playback>, String>),
     Results(Result<Vec<Track>, String>),
     Devices(Result<Vec<Device>, String>),
@@ -70,6 +100,35 @@ pub enum Msg {
         offset: u32,
         result: Result<Page<Track>, String>,
     },
+    LikedFlags {
+        uris: Vec<String>,
+        result: Result<Vec<bool>, String>,
+    },
+    LikeChanged {
+        uri: String,
+        liked: bool,
+        label: String,
+        result: Result<(), String>,
+    },
+    Added {
+        playlist_id: String,
+        playlist_name: String,
+        label: String,
+        result: Result<(), String>,
+    },
+    Created {
+        label: String,
+        created: Result<Playlist, String>,
+        /// Whether the track was added to the new playlist; unused if creating failed.
+        added: Result<(), String>,
+    },
+    Removed {
+        playlist_id: String,
+        playlist_name: String,
+        uri: String,
+        label: String,
+        result: Result<(), String>,
+    },
     Status(String),
     Error(String),
 }
@@ -79,6 +138,10 @@ pub enum Mode {
     Browse,
     Search,
     Devices,
+    /// Choosing a playlist (or "New playlist") for `picker_track`.
+    Picker,
+    /// Typing the name of a new playlist for `picker_track`.
+    NewPlaylist,
 }
 
 /// Which screen fills the main area. Left/Right walk a stack of these.
@@ -139,17 +202,46 @@ impl<T> Listing<T> {
         self.items.get(self.state.selected()?)
     }
 
-    /// Offset of the next page when the selection is near the end of what is loaded.
+    /// Offset of the next page, if there is one and it is not already being fetched.
+    fn next_page(&mut self) -> Option<u32> {
+        if self.loading || self.next_offset >= self.total {
+            return None;
+        }
+        self.loading = true;
+        Some(self.next_offset)
+    }
+
+    /// Like `next_page`, but only when the selection is near the end of what is loaded.
     fn want_more(&mut self) -> Option<u32> {
         let near_end = self
             .state
             .selected()
             .is_some_and(|i| i + PREFETCH_MARGIN >= self.items.len());
-        if self.loading || !near_end || self.next_offset >= self.total {
-            return None;
+        if near_end { self.next_page() } else { None }
+    }
+
+    /// Adds a new first item, as when something is created or liked just now.
+    fn insert_front(&mut self, item: T) {
+        self.items.insert(0, item);
+        self.total += 1;
+        self.next_offset += 1;
+        let selected = self.state.selected().map_or(0, |i| i + 1);
+        self.state.select(Some(selected));
+    }
+
+    /// Drops matching items, keeping the paging offsets and the selection valid.
+    fn remove_where(&mut self, matches: impl Fn(&T) -> bool) -> u32 {
+        let before = self.items.len();
+        self.items.retain(|item| !matches(item));
+        let removed = (before - self.items.len()) as u32;
+        self.total = self.total.saturating_sub(removed);
+        self.next_offset = self.next_offset.saturating_sub(removed);
+        match self.state.selected() {
+            _ if self.items.is_empty() => self.state.select(None),
+            Some(i) => self.state.select(Some(i.min(self.items.len() - 1))),
+            None => {}
         }
-        self.loading = true;
-        Some(self.next_offset)
+        removed
     }
 }
 
@@ -166,6 +258,16 @@ pub struct App {
     pub playlists: Listing<Playlist>,
     pub open_playlist: Option<Playlist>,
     pub playlist_tracks: Listing<Track>,
+    /// The user's Spotify id, used to tell which playlists can be written to.
+    pub me_id: Option<String>,
+    /// Whether each track seen so far is in Liked Songs. Absent means not checked yet.
+    pub liked_flags: HashMap<String, bool>,
+    /// The track being added to a playlist while the picker or name prompt is open.
+    pub picker_track: Option<Track>,
+    pub picker_state: ListState,
+    pub new_name: String,
+    /// The track `x` asked to remove; a second `x` on it confirms.
+    pending_remove: Option<String>,
     pub playback: Option<Playback>,
     /// When `playback` was fetched, to interpolate the progress bar between polls.
     pub playback_at: Instant,
@@ -204,6 +306,12 @@ impl App {
             playlists: Listing::new(),
             open_playlist: None,
             playlist_tracks: Listing::new(),
+            me_id: None,
+            liked_flags: HashMap::new(),
+            picker_track: None,
+            picker_state: ListState::default(),
+            new_name: String::new(),
+            pending_remove: None,
             playback: None,
             playback_at: now,
             devices: Vec::new(),
@@ -237,9 +345,75 @@ impl App {
         Some((base + extra).min(item.duration_ms))
     }
 
-    pub fn apply(&mut self, msg: Msg, now: Instant) {
+    /// A request to find out which of `tracks` are liked, for those not checked yet.
+    fn check_liked(&self, tracks: &[Track]) -> Option<Action> {
+        let uris: Vec<String> = tracks
+            .iter()
+            .filter(|t| is_likeable(&t.uri) && !self.liked_flags.contains_key(&t.uri))
+            .map(|t| t.uri.clone())
+            .collect();
+        (!uris.is_empty()).then_some(Action::CheckLiked(uris))
+    }
+
+    fn find_track(&self, uri: &str) -> Option<&Track> {
+        self.results
+            .iter()
+            .chain(&self.playlist_tracks.items)
+            .chain(&self.liked.items)
+            .find(|t| t.uri == uri)
+    }
+
+    /// Shows a track liked just now at the top of Liked Songs, if that list is loaded.
+    fn add_to_liked_list(&mut self, uri: &str) {
+        if !self.liked.loaded || self.liked.items.iter().any(|t| t.uri == uri) {
+            return;
+        }
+        if let Some(track) = self.find_track(uri).cloned() {
+            self.liked.insert_front(track);
+        }
+    }
+
+    fn bump_count(&mut self, playlist_id: &str, delta: i64) {
+        let adjust = |count: &mut Count| {
+            count.total = (i64::from(count.total) + delta).max(0) as u32;
+        };
+        if let Some(count) = self
+            .playlists
+            .items
+            .iter_mut()
+            .find(|p| p.id == playlist_id)
+            .and_then(|p| p.items.as_mut())
+        {
+            adjust(count);
+        }
+        if let Some(count) = self
+            .open_playlist
+            .as_mut()
+            .filter(|p| p.id == playlist_id)
+            .and_then(|p| p.items.as_mut())
+        {
+            adjust(count);
+        }
+    }
+
+    /// Playlists the user can add to: ones they own or collaborate on.
+    pub fn picker_playlists(&self) -> Vec<&Playlist> {
+        let Some(me) = &self.me_id else {
+            return Vec::new();
+        };
+        self.playlists
+            .items
+            .iter()
+            .filter(|p| p.writable_by(me))
+            .collect()
+    }
+
+    /// Applies a background result. May ask for follow-up work, such as checking
+    /// which freshly loaded tracks are liked.
+    pub fn apply(&mut self, msg: Msg, now: Instant) -> Option<Action> {
         match msg {
             Msg::Key(_) => {}
+            Msg::Me(Ok(id)) => self.me_id = Some(id),
             Msg::Playback(Ok(playback)) => {
                 self.playback = playback;
                 self.playback_at = now;
@@ -252,7 +426,9 @@ impl App {
                 } else {
                     format!("{} results", tracks.len())
                 });
+                let check = self.check_liked(&tracks);
                 self.results = tracks;
+                return check;
             }
             Msg::Devices(Ok(devices)) => {
                 let active = devices.iter().position(|d| d.is_active);
@@ -264,14 +440,28 @@ impl App {
                 self.devices = devices;
             }
             Msg::Liked { offset, result } => match result {
-                Ok(page) => self.liked.apply(offset, page),
+                Ok(page) => {
+                    for track in &page.items {
+                        self.liked_flags.insert(track.uri.clone(), true);
+                    }
+                    self.liked.apply(offset, page);
+                }
                 Err(e) => {
                     self.liked.loading = false;
                     self.error(&e);
                 }
             },
             Msg::Playlists { offset, result } => match result {
-                Ok(page) => self.playlists.apply(offset, page),
+                Ok(page) => {
+                    self.playlists.apply(offset, page);
+                    // The picker needs every page to know which playlists are writable.
+                    if self.mode == Mode::Picker {
+                        return self
+                            .playlists
+                            .next_page()
+                            .map(|offset| Action::LoadPlaylists { offset });
+                    }
+                }
                 Err(e) => {
                     self.playlists.loading = false;
                     self.error(&e);
@@ -280,10 +470,14 @@ impl App {
             Msg::PlaylistTracks { id, offset, result } => {
                 // The user may have gone back and opened another playlist meanwhile.
                 if self.open_playlist.as_ref().map(|p| p.id.as_str()) != Some(id.as_str()) {
-                    return;
+                    return None;
                 }
                 match result {
-                    Ok(page) => self.playlist_tracks.apply(offset, page),
+                    Ok(page) => {
+                        let check = self.check_liked(&page.items);
+                        self.playlist_tracks.apply(offset, page);
+                        return check;
+                    }
                     Err(e) => {
                         self.playlist_tracks.loading = false;
                         self.error(if e.contains("403") && !e.contains("scope") {
@@ -294,11 +488,93 @@ impl App {
                     }
                 }
             }
+            Msg::LikedFlags { uris, result } => match result {
+                Ok(flags) => {
+                    for (uri, liked) in uris.into_iter().zip(flags) {
+                        self.liked_flags.insert(uri, liked);
+                    }
+                }
+                Err(e) => self.error(&e),
+            },
+            Msg::LikeChanged {
+                uri,
+                liked,
+                label,
+                result,
+            } => match result {
+                Ok(()) => {
+                    self.liked_flags.insert(uri.clone(), liked);
+                    if liked {
+                        self.info(format!("Liked: {label}"));
+                        self.add_to_liked_list(&uri);
+                    } else {
+                        self.info(format!("Removed from Liked Songs: {label}"));
+                    }
+                }
+                Err(e) => self.error(&e),
+            },
+            Msg::Added {
+                playlist_id,
+                playlist_name,
+                label,
+                result,
+            } => match result {
+                Ok(()) => {
+                    self.info(format!("Added {label} to {playlist_name}"));
+                    self.bump_count(&playlist_id, 1);
+                }
+                Err(e) => self.error(&e),
+            },
+            Msg::Created {
+                label,
+                created,
+                added,
+            } => match created {
+                Ok(mut playlist) => {
+                    match &added {
+                        Ok(()) => self.info(format!("Created {} and added {label}", playlist.name)),
+                        Err(e) => self.error(&format!(
+                            "Created {}, but adding {label} failed: {e}",
+                            playlist.name
+                        )),
+                    }
+                    if self.playlists.loaded {
+                        playlist.items = Some(Count {
+                            total: u32::from(added.is_ok()),
+                        });
+                        self.playlists.insert_front(playlist);
+                    }
+                }
+                Err(e) => self.error(&e),
+            },
+            Msg::Removed {
+                playlist_id,
+                playlist_name,
+                uri,
+                label,
+                result,
+            } => match result {
+                Ok(()) => {
+                    if self
+                        .open_playlist
+                        .as_ref()
+                        .is_some_and(|p| p.id == playlist_id)
+                    {
+                        let removed = self.playlist_tracks.remove_where(|t| t.uri == uri);
+                        self.bump_count(&playlist_id, -i64::from(removed));
+                    }
+                    self.info(format!("Removed {label} from {playlist_name}"));
+                }
+                Err(e) => self.error(&e),
+            },
             Msg::Status(text) => self.info(text),
-            Msg::Playback(Err(e)) | Msg::Results(Err(e)) | Msg::Devices(Err(e)) | Msg::Error(e) => {
-                self.error(&e)
-            }
+            Msg::Me(Err(e))
+            | Msg::Playback(Err(e))
+            | Msg::Results(Err(e))
+            | Msg::Devices(Err(e))
+            | Msg::Error(e) => self.error(&e),
         }
+        None
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -312,6 +588,8 @@ impl App {
         match self.mode {
             Mode::Search => self.search_key(key.code),
             Mode::Devices => self.devices_key(key.code),
+            Mode::Picker => self.picker_key(key.code),
+            Mode::NewPlaylist => self.new_playlist_key(key.code),
             Mode::Browse => self.browse_key(key.code),
         }
     }
@@ -426,6 +704,77 @@ impl App {
         })
     }
 
+    /// `l`: like the highlighted track, or unlike it if it is already liked.
+    fn toggle_like(&mut self) -> Option<Action> {
+        let track = self.selected_track()?;
+        let (uri, label) = (track.uri.clone(), track.name.clone());
+        if !is_likeable(&uri) {
+            self.error("Only tracks and episodes can be liked.");
+            return None;
+        }
+        match self.liked_flags.get(&uri) {
+            Some(&liked) => Some(Action::SetLiked {
+                uri,
+                liked: !liked,
+                label,
+            }),
+            None => {
+                self.info("Still checking whether this is liked. Try again in a moment.");
+                None
+            }
+        }
+    }
+
+    /// `A`: choose a playlist to add the highlighted track to.
+    fn open_picker(&mut self) -> Option<Action> {
+        let track = self.selected_track()?.clone();
+        if !is_likeable(&track.uri) {
+            self.error("Only tracks and episodes can be added to playlists.");
+            return None;
+        }
+        if self.me_id.is_none() {
+            self.error(
+                "Your profile has not loaded yet, so your playlists are unknown. Try again.",
+            );
+            return None;
+        }
+        self.picker_track = Some(track);
+        self.picker_state.select(Some(0));
+        self.mode = Mode::Picker;
+        if !self.playlists.loaded && !self.playlists.loading {
+            self.playlists.loading = true;
+            return Some(Action::LoadPlaylists { offset: 0 });
+        }
+        // Pull any pages not loaded yet; the rest follow as each one arrives.
+        self.playlists
+            .next_page()
+            .map(|offset| Action::LoadPlaylists { offset })
+    }
+
+    /// `x`: remove the highlighted track from the open playlist after a second `x`.
+    fn remove_selected(&mut self, confirming: Option<String>) -> Option<Action> {
+        if self.view != View::PlaylistTracks {
+            return None;
+        }
+        let track = self.playlist_tracks.selected()?;
+        let playlist = self.open_playlist.as_ref()?;
+        let (uri, label) = (track.uri.clone(), track.name.clone());
+        let (playlist_id, playlist_name) = (playlist.id.clone(), playlist.name.clone());
+        if confirming.as_deref() == Some(uri.as_str()) {
+            return Some(Action::RemoveFromPlaylist {
+                playlist_id,
+                playlist_name,
+                uri,
+                label,
+            });
+        }
+        self.info(format!(
+            "Remove \"{label}\" from {playlist_name}? Press x again to confirm."
+        ));
+        self.pending_remove = Some(uri);
+        None
+    }
+
     fn move_selection(&mut self, delta: isize) -> Option<Action> {
         match self.view {
             View::Menu => step(&mut self.menu_state, MENU.len(), delta),
@@ -461,6 +810,11 @@ impl App {
     }
 
     fn browse_key(&mut self, code: KeyCode) -> Option<Action> {
+        // Only an immediately following `x` confirms a removal; any other key cancels it.
+        let confirming = self.pending_remove.take();
+        if confirming.is_some() && !matches!(code, KeyCode::Char('x') | KeyCode::Delete) {
+            self.status.clear();
+        }
         match code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Esc if self.history.is_empty() => self.quit = true,
@@ -476,6 +830,9 @@ impl App {
                     label: t.name.clone(),
                 });
             }
+            KeyCode::Char('l') => return self.toggle_like(),
+            KeyCode::Char('A') => return self.open_picker(),
+            KeyCode::Char('x') | KeyCode::Delete => return self.remove_selected(confirming),
             KeyCode::Char('P') => return self.play_playlist(),
             KeyCode::Char(' ') => {
                 let playing = self.playback.as_ref().is_some_and(|p| p.is_playing);
@@ -541,14 +898,66 @@ impl App {
         }
         None
     }
-}
 
+    /// The picker lists "New playlist..." first, then the playlists the user can write to.
+    fn picker_key(&mut self, code: KeyCode) -> Option<Action> {
+        let rows = self.picker_playlists().len() + 1;
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => step(&mut self.picker_state, rows, 1),
+            KeyCode::Up | KeyCode::Char('k') => step(&mut self.picker_state, rows, -1),
+            KeyCode::Esc => {
+                self.mode = Mode::Browse;
+                self.picker_track = None;
+            }
+            KeyCode::Enter => {
+                let selected = self.picker_state.selected()?;
+                if selected == 0 {
+                    self.new_name.clear();
+                    self.mode = Mode::NewPlaylist;
+                    return None;
+                }
+                let playlist = (*self.picker_playlists().get(selected - 1)?).clone();
+                let track = self.picker_track.take()?;
+                self.mode = Mode::Browse;
+                return Some(Action::AddToPlaylist {
+                    playlist_id: playlist.id,
+                    playlist_name: playlist.name,
+                    uri: track.uri,
+                    label: track.name,
+                });
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn new_playlist_key(&mut self, code: KeyCode) -> Option<Action> {
+        match code {
+            KeyCode::Char(c) => self.new_name.push(c),
+            KeyCode::Backspace => {
+                self.new_name.pop();
+            }
+            KeyCode::Esc => self.mode = Mode::Picker,
+            KeyCode::Enter if !self.new_name.trim().is_empty() => {
+                let track = self.picker_track.take()?;
+                self.mode = Mode::Browse;
+                return Some(Action::CreatePlaylist {
+                    name: self.new_name.trim().to_string(),
+                    uri: track.uri,
+                    label: track.name,
+                });
+            }
+            _ => {}
+        }
+        None
+    }
+}
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::api::{Album, Artist, Count, Item};
+    use crate::api::{Album, Artist, Count, Item, Owner};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -580,7 +989,22 @@ mod tests {
             name: format!("List {id}"),
             uri: format!("spotify:playlist:{id}"),
             items: Some(Count { total: 3 }),
-            owner: None,
+            owner: Some(Owner {
+                id: Some("me".into()),
+                display_name: Some("Me".into()),
+            }),
+            collaborative: false,
+        }
+    }
+
+    /// A playlist the user follows but neither owns nor collaborates on.
+    fn followed_playlist(id: &str) -> Playlist {
+        Playlist {
+            owner: Some(Owner {
+                id: Some("someone-else".into()),
+                display_name: None,
+            }),
+            ..playlist(id)
         }
     }
 
@@ -1147,6 +1571,563 @@ mod tests {
             now,
         );
         assert!(app.status.contains("spotui login"), "{}", app.status);
+    }
+
+    /// Search results "one" and "two", flags known, profile loaded, and three playlists
+    /// loaded of which two (p1, p3) are writable.
+    fn app_ready_to_add() -> App {
+        let now = Instant::now();
+        let mut app = app_with_results();
+        app.apply(Msg::Me(Ok("me".into())), now);
+        app.apply(
+            Msg::LikedFlags {
+                uris: vec!["spotify:track:one".into(), "spotify:track:two".into()],
+                result: Ok(vec![false, true]),
+            },
+            now,
+        );
+        app.apply(
+            Msg::Playlists {
+                offset: 0,
+                result: Ok(page(
+                    vec![playlist("p1"), followed_playlist("p2"), playlist("p3")],
+                    3,
+                )),
+            },
+            now,
+        );
+        app
+    }
+
+    fn local_track() -> Track {
+        Track {
+            uri: "spotify:local:a:b:c:1".into(),
+            ..track("local")
+        }
+    }
+
+    #[test]
+    fn l_likes_an_unliked_track_and_unlikes_a_liked_one() {
+        let mut app = app_ready_to_add();
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('l'))),
+            Some(Action::SetLiked {
+                uri: "spotify:track:one".into(),
+                liked: true,
+                label: "one".into()
+            })
+        );
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('l'))),
+            Some(Action::SetLiked {
+                uri: "spotify:track:two".into(),
+                liked: false,
+                label: "two".into()
+            })
+        );
+    }
+
+    #[test]
+    fn l_waits_until_the_liked_status_is_known() {
+        let mut app = app_with_results();
+        assert_eq!(app.on_key(key(KeyCode::Char('l'))), None);
+        assert!(app.status.contains("Still checking"), "{}", app.status);
+        assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn local_files_cannot_be_liked_or_added() {
+        let now = Instant::now();
+        let mut app = app_with_results();
+        app.apply(Msg::Results(Ok(vec![local_track()])), now);
+        assert_eq!(app.on_key(key(KeyCode::Char('l'))), None);
+        assert!(app.status_is_error, "{}", app.status);
+        app.apply(Msg::Me(Ok("me".into())), now);
+        assert_eq!(app.on_key(key(KeyCode::Char('A'))), None);
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn fresh_results_request_a_liked_check_for_unchecked_likeable_tracks_only() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        let results = vec![track("one"), local_track(), track("two")];
+        assert_eq!(
+            app.apply(Msg::Results(Ok(results)), now),
+            Some(Action::CheckLiked(vec![
+                "spotify:track:one".into(),
+                "spotify:track:two".into()
+            ]))
+        );
+        app.apply(
+            Msg::LikedFlags {
+                uris: vec!["spotify:track:one".into(), "spotify:track:two".into()],
+                result: Ok(vec![true, false]),
+            },
+            now,
+        );
+        let again = vec![track("one"), track("two")];
+        assert_eq!(app.apply(Msg::Results(Ok(again)), now), None);
+        assert!(app.liked_flags["spotify:track:one"]);
+        assert!(!app.liked_flags["spotify:track:two"]);
+    }
+
+    #[test]
+    fn liked_songs_pages_are_known_liked_without_a_check() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        let follow_up = app.apply(
+            Msg::Liked {
+                offset: 0,
+                result: Ok(page(tracks(2), 2)),
+            },
+            now,
+        );
+        assert_eq!(follow_up, None);
+        assert_eq!(app.liked_flags.len(), 2);
+        assert!(app.liked_flags.values().all(|liked| *liked));
+    }
+
+    #[test]
+    fn playlist_pages_request_a_liked_check_too() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Right));
+        app.apply(
+            Msg::Playlists {
+                offset: 0,
+                result: Ok(page(vec![playlist("p1")], 1)),
+            },
+            now,
+        );
+        app.on_key(key(KeyCode::Right));
+        let follow_up = app.apply(
+            Msg::PlaylistTracks {
+                id: "p1".into(),
+                offset: 0,
+                result: Ok(page(tracks(2), 2)),
+            },
+            now,
+        );
+        assert_eq!(
+            follow_up,
+            Some(Action::CheckLiked(vec![
+                "spotify:track:t0".into(),
+                "spotify:track:t1".into()
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_track_liked_now_appears_once_at_the_top_of_a_loaded_liked_list() {
+        let now = Instant::now();
+        let mut app = app_in_liked(3, 3);
+        app.apply(Msg::Results(Ok(vec![track("new")])), now);
+        let liked = |app: &mut App| {
+            app.apply(
+                Msg::LikeChanged {
+                    uri: "spotify:track:new".into(),
+                    liked: true,
+                    label: "new".into(),
+                    result: Ok(()),
+                },
+                now,
+            )
+        };
+        liked(&mut app);
+        liked(&mut app);
+        assert_eq!(app.liked.items.len(), 4);
+        assert_eq!(app.liked.items[0].uri, "spotify:track:new");
+        assert_eq!(app.liked.total, 4);
+        assert_eq!(
+            app.liked.state.selected(),
+            Some(1),
+            "selection stays on the same song"
+        );
+        assert!(app.status.contains("Liked: new"), "{}", app.status);
+    }
+
+    #[test]
+    fn unliking_clears_the_flag_but_keeps_the_row_until_the_list_reloads() {
+        let now = Instant::now();
+        let mut app = app_in_liked(3, 3);
+        app.apply(
+            Msg::LikeChanged {
+                uri: "spotify:track:t1".into(),
+                liked: false,
+                label: "t1".into(),
+                result: Ok(()),
+            },
+            now,
+        );
+        assert!(!app.liked_flags["spotify:track:t1"]);
+        assert_eq!(app.liked.items.len(), 3);
+    }
+
+    #[test]
+    fn a_failed_like_shows_the_error_and_keeps_the_flag() {
+        let now = Instant::now();
+        let mut app = app_ready_to_add();
+        app.apply(
+            Msg::LikeChanged {
+                uri: "spotify:track:one".into(),
+                liked: true,
+                label: "one".into(),
+                result: Err("403 Insufficient client scope".into()),
+            },
+            now,
+        );
+        assert!(app.status_is_error);
+        assert!(!app.liked_flags["spotify:track:one"]);
+    }
+
+    #[test]
+    fn the_picker_offers_new_playlist_then_only_playlists_the_user_can_write_to() {
+        let mut app = app_ready_to_add();
+        assert_eq!(app.on_key(key(KeyCode::Char('A'))), None);
+        assert_eq!(app.mode, Mode::Picker);
+        let ids: Vec<&str> = app
+            .picker_playlists()
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(ids, ["p1", "p3"]);
+        // Rows: 0 = New playlist, 1 = p1, 2 = p3; Down stops at the last row.
+        for _ in 0..5 {
+            app.on_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.picker_state.selected(), Some(2));
+    }
+
+    #[test]
+    fn enter_on_a_playlist_in_the_picker_adds_the_track() {
+        let mut app = app_ready_to_add();
+        app.on_key(key(KeyCode::Char('A')));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::AddToPlaylist {
+                playlist_id: "p3".into(),
+                playlist_name: "List p3".into(),
+                uri: "spotify:track:one".into(),
+                label: "one".into()
+            })
+        );
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.picker_track.is_none());
+    }
+
+    #[test]
+    fn new_playlist_asks_for_a_name_then_creates_it_with_the_track() {
+        let mut app = app_ready_to_add();
+        app.on_key(key(KeyCode::Char('A')));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
+        assert_eq!(app.mode, Mode::NewPlaylist);
+        chars(&mut app, "  ");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            None,
+            "blank name is refused"
+        );
+        assert_eq!(app.mode, Mode::NewPlaylist);
+        chars(&mut app, "My Mix x");
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::CreatePlaylist {
+                name: "My Mix".into(),
+                uri: "spotify:track:one".into(),
+                label: "one".into()
+            })
+        );
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn escape_steps_back_from_the_name_prompt_to_the_picker_and_then_out() {
+        let mut app = app_ready_to_add();
+        app.on_key(key(KeyCode::Char('A')));
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Picker);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.picker_track.is_none());
+    }
+
+    #[test]
+    fn q_while_typing_a_playlist_name_is_text_not_quit() {
+        let mut app = app_ready_to_add();
+        app.on_key(key(KeyCode::Char('A')));
+        app.on_key(key(KeyCode::Enter));
+        chars(&mut app, "quiet");
+        assert!(!app.quit);
+        assert_eq!(app.new_name, "quiet");
+    }
+
+    #[test]
+    fn add_needs_the_profile_to_have_loaded() {
+        let now = Instant::now();
+        let mut app = app_with_results();
+        app.apply(Msg::Results(Ok(vec![track("one")])), now);
+        assert_eq!(app.on_key(key(KeyCode::Char('A'))), None);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn the_picker_loads_playlists_first_and_then_every_remaining_page() {
+        let now = Instant::now();
+        let mut app = app_with_results();
+        app.apply(Msg::Me(Ok("me".into())), now);
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('A'))),
+            Some(Action::LoadPlaylists { offset: 0 })
+        );
+        let first = app.apply(
+            Msg::Playlists {
+                offset: 0,
+                result: Ok(page(vec![playlist("p1")], 120)),
+            },
+            now,
+        );
+        assert_eq!(first, Some(Action::LoadPlaylists { offset: 1 }));
+        let last = app.apply(
+            Msg::Playlists {
+                offset: 1,
+                result: Ok(page(vec![playlist("p2")], 2)),
+            },
+            now,
+        );
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn add_is_not_offered_on_the_menu_or_playlist_list() {
+        let mut app = App::new(Instant::now());
+        assert_eq!(app.on_key(key(KeyCode::Char('A'))), None);
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn a_playlist_created_for_a_track_appears_first_with_its_count() {
+        let now = Instant::now();
+        let mut app = app_ready_to_add();
+        app.apply(
+            Msg::Created {
+                label: "one".into(),
+                created: Ok(Playlist {
+                    items: None,
+                    ..playlist("new")
+                }),
+                added: Ok(()),
+            },
+            now,
+        );
+        assert_eq!(app.playlists.items[0].id, "new");
+        assert_eq!(app.playlists.items[0].items.as_ref().unwrap().total, 1);
+        assert_eq!(app.playlists.total, 4);
+        assert!(
+            app.status.contains("Created List new and added one"),
+            "{}",
+            app.status
+        );
+        assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn a_playlist_created_but_not_filled_reports_the_add_failure() {
+        let now = Instant::now();
+        let mut app = app_ready_to_add();
+        app.apply(
+            Msg::Created {
+                label: "one".into(),
+                created: Ok(playlist("new")),
+                added: Err("403".into()),
+            },
+            now,
+        );
+        assert!(app.status_is_error);
+        assert!(app.status.contains("adding one failed"), "{}", app.status);
+        assert_eq!(app.playlists.items[0].items.as_ref().unwrap().total, 0);
+    }
+
+    #[test]
+    fn creating_a_playlist_before_the_list_is_loaded_leaves_it_to_load_fresh_later() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.apply(
+            Msg::Created {
+                label: "one".into(),
+                created: Ok(playlist("new")),
+                added: Ok(()),
+            },
+            now,
+        );
+        assert!(app.playlists.items.is_empty());
+    }
+
+    #[test]
+    fn adding_a_track_bumps_that_playlists_count() {
+        let now = Instant::now();
+        let mut app = app_ready_to_add();
+        app.apply(
+            Msg::Added {
+                playlist_id: "p1".into(),
+                playlist_name: "List p1".into(),
+                label: "one".into(),
+                result: Ok(()),
+            },
+            now,
+        );
+        assert_eq!(app.playlists.items[0].items.as_ref().unwrap().total, 4);
+        assert!(
+            app.status.contains("Added one to List p1"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn x_asks_first_and_a_second_x_removes_the_track() {
+        let mut app = app_in_playlist(3, 3);
+        assert_eq!(app.on_key(key(KeyCode::Char('x'))), None);
+        assert!(
+            app.status.contains("Remove \"t0\" from List p1"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('x'))),
+            Some(Action::RemoveFromPlaylist {
+                playlist_id: "p1".into(),
+                playlist_name: "List p1".into(),
+                uri: "spotify:track:t0".into(),
+                label: "t0".into()
+            })
+        );
+    }
+
+    #[test]
+    fn any_other_key_cancels_a_pending_removal() {
+        let mut app = app_in_playlist(3, 3);
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.status, "", "the prompt is cleared");
+        // x now asks about the newly highlighted track instead of removing t0.
+        assert_eq!(app.on_key(key(KeyCode::Char('x'))), None);
+        assert!(app.status.contains("\"t1\""), "{}", app.status);
+    }
+
+    #[test]
+    fn x_does_nothing_outside_an_open_playlist() {
+        let mut app = app_in_liked(3, 3);
+        assert_eq!(app.on_key(key(KeyCode::Char('x'))), None);
+        assert_eq!(app.on_key(key(KeyCode::Char('x'))), None);
+        assert_eq!(app.status, "");
+    }
+
+    #[test]
+    fn a_removed_track_leaves_the_list_and_the_counts_drop() {
+        let now = Instant::now();
+        let mut app = app_in_playlist(3, 3);
+        app.on_key(key(KeyCode::Down));
+        app.apply(
+            Msg::Removed {
+                playlist_id: "p1".into(),
+                playlist_name: "List p1".into(),
+                uri: "spotify:track:t1".into(),
+                label: "t1".into(),
+                result: Ok(()),
+            },
+            now,
+        );
+        let uris: Vec<&str> = app
+            .playlist_tracks
+            .items
+            .iter()
+            .map(|t| t.uri.as_str())
+            .collect();
+        assert_eq!(uris, ["spotify:track:t0", "spotify:track:t2"]);
+        assert_eq!(app.playlist_tracks.total, 2);
+        assert_eq!(app.playlists.items[0].items.as_ref().unwrap().total, 2);
+        assert_eq!(
+            app.open_playlist
+                .as_ref()
+                .unwrap()
+                .items
+                .as_ref()
+                .unwrap()
+                .total,
+            2
+        );
+        assert!(
+            app.status.contains("Removed t1 from List p1"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn removing_the_last_row_moves_the_selection_up_and_the_last_track_empties_the_list() {
+        let now = Instant::now();
+        let mut app = app_in_playlist(2, 2);
+        app.on_key(key(KeyCode::Down));
+        let removed = |app: &mut App, name: &str| {
+            app.apply(
+                Msg::Removed {
+                    playlist_id: "p1".into(),
+                    playlist_name: "List p1".into(),
+                    uri: format!("spotify:track:{name}"),
+                    label: name.into(),
+                    result: Ok(()),
+                },
+                now,
+            )
+        };
+        removed(&mut app, "t1");
+        assert_eq!(app.playlist_tracks.state.selected(), Some(0));
+        removed(&mut app, "t0");
+        assert_eq!(app.playlist_tracks.state.selected(), None);
+    }
+
+    #[test]
+    fn a_removal_confirmed_for_a_playlist_the_user_left_does_not_touch_the_open_one() {
+        let now = Instant::now();
+        let mut app = app_in_playlist(3, 3);
+        app.apply(
+            Msg::Removed {
+                playlist_id: "other".into(),
+                playlist_name: "Other".into(),
+                uri: "spotify:track:t1".into(),
+                label: "t1".into(),
+                result: Ok(()),
+            },
+            now,
+        );
+        assert_eq!(app.playlist_tracks.items.len(), 3);
+    }
+
+    #[test]
+    fn a_failed_removal_keeps_the_track_and_shows_the_error() {
+        let now = Instant::now();
+        let mut app = app_in_playlist(3, 3);
+        app.apply(
+            Msg::Removed {
+                playlist_id: "p1".into(),
+                playlist_name: "List p1".into(),
+                uri: "spotify:track:t0".into(),
+                label: "t0".into(),
+                result: Err("403 Forbidden".into()),
+            },
+            now,
+        );
+        assert_eq!(app.playlist_tracks.items.len(), 3);
+        assert!(app.status_is_error);
     }
 
     #[test]

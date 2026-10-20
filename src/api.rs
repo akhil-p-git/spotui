@@ -26,7 +26,7 @@ struct Devices {
     devices: Vec<Device>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Artist {
     pub name: String,
 }
@@ -49,13 +49,13 @@ pub struct Playback {
     pub item: Option<Item>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Album {
     pub name: String,
 }
 
 /// A track, or a podcast episode inside a playlist (which has no artists or album).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Track {
     pub uri: String,
     pub name: String,
@@ -73,6 +73,20 @@ pub struct Playlist {
     /// Track count. Spotify omits it for playlists the user neither owns nor collaborates on.
     pub items: Option<Count>,
     pub owner: Option<Owner>,
+    #[serde(default)]
+    pub collaborative: bool,
+}
+
+impl Playlist {
+    /// Whether `user_id` may add to and remove from this playlist.
+    pub fn writable_by(&self, user_id: &str) -> bool {
+        self.collaborative
+            || self
+                .owner
+                .as_ref()
+                .and_then(|o| o.id.as_deref())
+                .is_some_and(|id| id == user_id)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +96,7 @@ pub struct Count {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Owner {
+    pub id: Option<String>,
     pub display_name: Option<String>,
 }
 
@@ -332,6 +347,69 @@ impl Api {
         })
     }
 
+    /// Adds tracks or episodes to Liked Songs. Needs the `user-library-modify` scope.
+    pub async fn save(&self, uris: &[String]) -> Result<()> {
+        let params = [("uris", uris.join(","))];
+        self.send(Method::PUT, "/me/library", &params, None).await?;
+        Ok(())
+    }
+
+    /// Removes tracks or episodes from Liked Songs.
+    pub async fn unsave(&self, uris: &[String]) -> Result<()> {
+        let params = [("uris", uris.join(","))];
+        self.send(Method::DELETE, "/me/library", &params, None)
+            .await?;
+        Ok(())
+    }
+
+    /// For each URI, whether it is in Liked Songs. Spotify takes 40 URIs per request.
+    pub async fn saved(&self, uris: &[String]) -> Result<Vec<bool>> {
+        let mut flags = Vec::with_capacity(uris.len());
+        for chunk in uris.chunks(40) {
+            let params = [("uris", chunk.join(","))];
+            let resp = self
+                .send(Method::GET, "/me/library/contains", &params, None)
+                .await?;
+            flags.extend(resp.json::<Vec<bool>>().await?);
+        }
+        Ok(flags)
+    }
+
+    /// Creates an empty private playlist. Needs `playlist-modify-private`.
+    pub async fn create_playlist(&self, name: &str) -> Result<Playlist> {
+        let body = json!({ "name": name, "public": false });
+        let resp = self
+            .send(Method::POST, "/me/playlists", &[], Some(body))
+            .await?;
+        Ok(resp.json().await?)
+    }
+
+    /// Appends a track or episode to a playlist the user owns or collaborates on.
+    pub async fn add_to_playlist(&self, playlist_id: &str, uri: &str) -> Result<()> {
+        let body = json!({ "uris": [uri] });
+        self.send(
+            Method::POST,
+            &format!("/playlists/{playlist_id}/items"),
+            &[],
+            Some(body),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Removes a track or episode from a playlist.
+    pub async fn remove_from_playlist(&self, playlist_id: &str, uri: &str) -> Result<()> {
+        let body = json!({ "items": [{ "uri": uri }] });
+        self.send(
+            Method::DELETE,
+            &format!("/playlists/{playlist_id}/items"),
+            &[],
+            Some(body),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Appends a track or episode URI to the playback queue.
     pub async fn queue(&self, uri: &str) -> Result<()> {
         let params = [("uri", uri.to_string())];
@@ -359,33 +437,48 @@ mod tests {
     /// Serves one canned response on a loopback port and returns the raw
     /// request it received (headers and body).
     async fn serve_once(response: impl Into<String>) -> (Api, JoinHandle<String>) {
-        let response = response.into();
+        let (api, handle) = serve_sequence(vec![response.into()]).await;
+        let first = tokio::spawn(async move { handle.await.unwrap().remove(0) });
+        (api, first)
+    }
+
+    /// Reads one HTTP request (headers and body) from `socket`.
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            raw.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&raw);
+            if let Some(split) = text.find("\r\n\r\n") {
+                let length = text[..split]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if raw.len() >= split + 4 + length {
+                    return String::from_utf8(raw).unwrap();
+                }
+            }
+        }
+    }
+
+    /// Answers consecutive requests with `responses` in order, one connection each
+    /// (give multi-request responses `Connection: close`), and returns the requests.
+    async fn serve_sequence(responses: Vec<String>) -> (Api, JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let handle = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut raw = Vec::new();
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = socket.read(&mut buf).await.unwrap();
-                raw.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&raw);
-                if let Some(split) = text.find("\r\n\r\n") {
-                    let length = text[..split]
-                        .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|v| v.trim().parse::<usize>().unwrap())
-                        })
-                        .unwrap_or(0);
-                    if raw.len() >= split + 4 + length {
-                        break;
-                    }
-                }
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut socket).await);
+                socket.write_all(response.as_bytes()).await.unwrap();
             }
-            socket.write_all(response.as_bytes()).await.unwrap();
-            String::from_utf8(raw).unwrap()
+            requests
         });
         (Api::with_base("tok".into(), base), handle)
     }
@@ -629,6 +722,134 @@ mod tests {
             err.contains("403"),
             "the raw response stays available: {err}"
         );
+    }
+
+    /// Decoded value of query parameter `name` from a raw request's first line.
+    fn query_param(raw: &str, name: &str) -> Option<String> {
+        let target = raw.lines().next()?.split_whitespace().nth(1)?;
+        let url = reqwest::Url::parse(&format!("http://x{target}")).ok()?;
+        url.query_pairs()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.into_owned())
+    }
+
+    fn uris(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("spotify:track:t{i}")).collect()
+    }
+
+    #[tokio::test]
+    async fn save_puts_the_uris_as_one_comma_separated_parameter() {
+        let (api, request) = serve_once(NO_CONTENT).await;
+        api.save(&uris(2)).await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(raw.starts_with("PUT /me/library?"), "{raw}");
+        assert_eq!(
+            query_param(&raw, "uris").unwrap(),
+            "spotify:track:t0,spotify:track:t1"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsave_uses_delete_on_the_same_endpoint() {
+        let (api, request) = serve_once(NO_CONTENT).await;
+        api.unsave(&uris(1)).await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(raw.starts_with("DELETE /me/library?"), "{raw}");
+        assert_eq!(query_param(&raw, "uris").unwrap(), "spotify:track:t0");
+    }
+
+    #[tokio::test]
+    async fn saved_asks_in_batches_of_40_and_keeps_the_order() {
+        let ok = |body: &str| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let first = format!("[{}]", vec!["true"; 40].join(","));
+        let (api, requests) = serve_sequence(vec![ok(&first), ok("[false]")]).await;
+        let flags = api.saved(&uris(41)).await.unwrap();
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].starts_with("GET /me/library/contains?"),
+            "{}",
+            requests[0]
+        );
+        assert_eq!(
+            query_param(&requests[0], "uris")
+                .unwrap()
+                .split(',')
+                .count(),
+            40
+        );
+        assert_eq!(
+            query_param(&requests[1], "uris").unwrap(),
+            "spotify:track:t40"
+        );
+        assert_eq!(flags.len(), 41);
+        assert!(flags[..40].iter().all(|f| *f) && !flags[40]);
+    }
+
+    #[tokio::test]
+    async fn create_playlist_posts_a_private_playlist_and_returns_it() {
+        let body = r#"{"id":"new1","name":"Road","uri":"spotify:playlist:new1",
+            "owner":{"id":"me","display_name":"Akhil"},"collaborative":false}"#;
+        let (api, request) = serve_once(format!(
+            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let playlist = api.create_playlist("Road").await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(raw.starts_with("POST /me/playlists "), "{raw}");
+        assert!(raw.ends_with(r#"{"name":"Road","public":false}"#), "{raw}");
+        assert_eq!(
+            (playlist.id.as_str(), playlist.uri.as_str()),
+            ("new1", "spotify:playlist:new1")
+        );
+    }
+
+    #[tokio::test]
+    async fn add_to_playlist_posts_the_uri_in_the_body() {
+        let (api, request) = serve_once(NO_CONTENT).await;
+        api.add_to_playlist("p1", "spotify:track:a").await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(raw.starts_with("POST /playlists/p1/items "), "{raw}");
+        assert!(raw.ends_with(r#"{"uris":["spotify:track:a"]}"#), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn remove_from_playlist_sends_delete_with_an_items_body() {
+        let (api, request) = serve_once(NO_CONTENT).await;
+        api.remove_from_playlist("p1", "spotify:track:a")
+            .await
+            .unwrap();
+        let raw = request.await.unwrap();
+        assert!(raw.starts_with("DELETE /playlists/p1/items "), "{raw}");
+        assert!(
+            raw.ends_with(r#"{"items":[{"uri":"spotify:track:a"}]}"#),
+            "{raw}"
+        );
+    }
+
+    #[test]
+    fn writable_by_means_owner_or_collaborator() {
+        let playlist = |owner: Option<&str>, collaborative| Playlist {
+            id: "p".into(),
+            name: "P".into(),
+            uri: "spotify:playlist:p".into(),
+            items: None,
+            owner: owner.map(|id| Owner {
+                id: Some(id.into()),
+                display_name: None,
+            }),
+            collaborative,
+        };
+        assert!(playlist(Some("me"), false).writable_by("me"));
+        assert!(!playlist(Some("someone"), false).writable_by("me"));
+        assert!(playlist(Some("someone"), true).writable_by("me"));
+        assert!(!playlist(None, false).writable_by("me"));
     }
 
     #[tokio::test]

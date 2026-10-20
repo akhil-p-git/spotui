@@ -1,5 +1,6 @@
 //! Terminal rendering and the event loop that ties input, timers and API calls together.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,13 +22,13 @@ fn help(view: View) -> &'static str {
     match view {
         View::Menu => "up/down move  right open  / search  space pause  n/p skip  d device  q quit",
         View::Search | View::Liked => {
-            "left back  enter play  a queue  / search  space pause  n/p skip  +/- vol  q quit"
+            "left back  enter play  l like  A add  a queue  / search  space pause  q quit"
         }
         View::Playlists => {
             "left back  right open  P play playlist  / search  space pause  n/p skip  q quit"
         }
         View::PlaylistTracks => {
-            "left back  enter play  a queue  P play all  space pause  n/p skip  q quit"
+            "left back  enter play  l like  A add  x remove  P play all  a queue  q quit"
         }
     }
 }
@@ -51,9 +52,58 @@ pub fn draw(frame: &mut Frame, app: &mut App, now: Instant) {
     draw_main(frame, app, list_area);
     draw_now_playing(frame, app, now_area, now);
     draw_status(frame, app, status_area);
-    if app.mode == Mode::Devices {
-        draw_devices(frame, app);
+    match app.mode {
+        Mode::Devices => draw_devices(frame, app),
+        Mode::Picker => draw_picker(frame, app),
+        Mode::NewPlaylist => draw_new_playlist(frame, app),
+        Mode::Browse | Mode::Search => {}
     }
+}
+
+/// A popup `height` rows tall and `percent` of the screen wide, centred.
+fn centered(frame: &Frame, height: u16, percent: u16) -> Rect {
+    let [area] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(frame.area());
+    let [area] = Layout::horizontal([Constraint::Percentage(percent)])
+        .flex(Flex::Center)
+        .areas(area);
+    area
+}
+
+fn draw_picker(frame: &mut Frame, app: &mut App) {
+    let mut items = vec![ListItem::new("+ New playlist...")];
+    items.extend(app.picker_playlists().into_iter().map(|p| {
+        let count = p.items.as_ref().map(|c| format!("  {} tracks", c.total));
+        ListItem::new(Line::from(vec![
+            Span::raw(p.name.clone()),
+            dim(count.unwrap_or_default()),
+        ]))
+    }));
+    let rows = items.len() as u16;
+    let area = centered(frame, (rows + 2).min(14), 60);
+    frame.render_widget(Clear, area);
+    let title = match &app.picker_track {
+        Some(track) => format!(" Add \"{}\" to... (enter, esc) ", track.name),
+        None => " Add to... ".to_string(),
+    };
+    let list = List::new(items)
+        .block(Block::bordered().title(title))
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(list, area, &mut app.picker_state);
+}
+
+fn draw_new_playlist(frame: &mut Frame, app: &App) {
+    let area = centered(frame, 3, 60);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" New playlist name (enter create, esc back) ")
+        .border_style(Style::new().fg(Color::Yellow));
+    frame.render_widget(
+        Paragraph::new(format!("{}\u{258f}", app.new_name)).block(block),
+        area,
+    );
 }
 
 fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
@@ -77,10 +127,16 @@ fn dim(text: String) -> Span<'static> {
     Span::styled(text, Style::new().fg(Color::DarkGray))
 }
 
-fn track_items(tracks: &[Track]) -> Vec<ListItem<'static>> {
+/// Rows for `tracks`, with a red heart on the ones known to be in Liked Songs.
+fn track_items(tracks: &[Track], liked: &HashMap<String, bool>) -> Vec<ListItem<'static>> {
     tracks
         .iter()
         .map(|t| {
+            let heart = if liked.get(&t.uri).copied().unwrap_or(false) {
+                Span::styled("\u{2665} ", Style::new().fg(Color::Red))
+            } else {
+                Span::raw("  ")
+            };
             let artists: Vec<&str> = t.artists.iter().map(|a| a.name.as_str()).collect();
             let mut details = Vec::new();
             if !artists.is_empty() {
@@ -91,6 +147,7 @@ fn track_items(tracks: &[Track]) -> Vec<ListItem<'static>> {
             }
             details.push(format_ms(t.duration_ms));
             ListItem::new(Line::from(vec![
+                heart,
                 Span::raw(t.name.clone()),
                 dim(format!("  {}", details.join("  "))),
             ]))
@@ -147,7 +204,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
             frame,
             area,
             " Results ".into(),
-            track_items(&app.results),
+            track_items(&app.results, &app.liked_flags),
             &mut app.results_state,
             "Press / to search for tracks.",
         ),
@@ -161,7 +218,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
                     app.liked.items.len(),
                     app.liked.total
                 ),
-                track_items(&app.liked.items),
+                track_items(&app.liked.items, &app.liked_flags),
                 &mut app.liked.state,
                 none,
             );
@@ -214,7 +271,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
                 frame,
                 area,
                 title,
-                track_items(&app.playlist_tracks.items),
+                track_items(&app.playlist_tracks.items, &app.liked_flags),
                 &mut app.playlist_tracks.state,
                 none,
             );
@@ -389,6 +446,73 @@ impl Ctx {
                 let result = api.playlist_tracks(&id, offset).await.map_err(err);
                 Msg::PlaylistTracks { id, offset, result }
             }),
+            Action::CheckLiked(uris) => self.spawn(move |api| async move {
+                let result = api.saved(&uris).await.map_err(err);
+                Msg::LikedFlags { uris, result }
+            }),
+            Action::SetLiked { uri, liked, label } => self.spawn(move |api| async move {
+                let uris = [uri.clone()];
+                let result = if liked {
+                    api.save(&uris).await
+                } else {
+                    api.unsave(&uris).await
+                };
+                Msg::LikeChanged {
+                    uri,
+                    liked,
+                    label,
+                    result: result.map_err(err),
+                }
+            }),
+            Action::CreatePlaylist { name, uri, label } => self.spawn(move |api| async move {
+                match api.create_playlist(&name).await {
+                    Ok(playlist) => {
+                        let added = api.add_to_playlist(&playlist.id, &uri).await.map_err(err);
+                        Msg::Created {
+                            label,
+                            created: Ok(playlist),
+                            added,
+                        }
+                    }
+                    Err(e) => Msg::Created {
+                        label,
+                        created: Err(err(e)),
+                        added: Ok(()),
+                    },
+                }
+            }),
+            Action::AddToPlaylist {
+                playlist_id,
+                playlist_name,
+                uri,
+                label,
+            } => self.spawn(move |api| async move {
+                let result = api.add_to_playlist(&playlist_id, &uri).await.map_err(err);
+                Msg::Added {
+                    playlist_id,
+                    playlist_name,
+                    label,
+                    result,
+                }
+            }),
+            Action::RemoveFromPlaylist {
+                playlist_id,
+                playlist_name,
+                uri,
+                label,
+            } => self.spawn(move |api| async move {
+                let result = api
+                    .remove_from_playlist(&playlist_id, &uri)
+                    .await
+                    .map_err(err);
+                Msg::Removed {
+                    playlist_id,
+                    playlist_name,
+                    uri,
+                    label,
+                    result,
+                }
+            }),
             Action::PlayUris(uris) => {
                 self.control(move |api| async move { api.play_uris(&uris).await })
             }
@@ -449,18 +573,21 @@ async fn event_loop(terminal: &mut DefaultTerminal, config: auth::Config) -> Res
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut ticks = 0u32;
     ctx.refresh_playback();
+    // Needed to tell which playlists the user can add to.
+    ctx.spawn(|api| async move { Msg::Me(api.me().await.map(|me| me.id).map_err(err)) });
 
     while !app.quit {
         terminal.draw(|frame| draw(frame, &mut app, Instant::now()))?;
         tokio::select! {
-            Some(msg) = rx.recv() => match msg {
-                Msg::Key(key) => {
-                    if let Some(action) = app.on_key(key) {
-                        ctx.perform(action);
-                    }
+            Some(msg) = rx.recv() => {
+                let follow_up = match msg {
+                    Msg::Key(key) => app.on_key(key),
+                    other => app.apply(other, Instant::now()),
+                };
+                if let Some(action) = follow_up {
+                    ctx.perform(action);
                 }
-                other => app.apply(other, Instant::now()),
-            },
+            }
             _ = tick.tick() => {
                 ticks += 1;
                 if ticks.is_multiple_of(POLL_EVERY_TICKS) {
@@ -533,6 +660,116 @@ mod tests {
             total,
             fetched,
         }
+    }
+
+    fn playlist(id: &str, name: &str, owner: &str, count: Option<u32>) -> Playlist {
+        Playlist {
+            id: id.into(),
+            name: name.into(),
+            uri: format!("spotify:playlist:{id}"),
+            items: count.map(|total| Count { total }),
+            owner: Some(Owner {
+                id: Some(owner.into()),
+                display_name: Some(owner.into()),
+            }),
+            collaborative: false,
+        }
+    }
+
+    #[test]
+    fn liked_tracks_get_a_heart_and_others_do_not() {
+        let t0 = Instant::now();
+        let mut app = App::new(t0);
+        app.view = View::Search;
+        let tracks = vec![
+            track("Loved Song", &["A"], None),
+            track("Plain Song", &["A"], None),
+        ];
+        app.apply(Msg::Results(Ok(tracks)), t0);
+        app.apply(
+            Msg::LikedFlags {
+                uris: vec![
+                    "spotify:track:Loved Song".into(),
+                    "spotify:track:Plain Song".into(),
+                ],
+                result: Ok(vec![true, false]),
+            },
+            t0,
+        );
+        let screen = render(&mut app, t0);
+        assert!(screen.contains("\u{2665} Loved Song"), "{screen}");
+        assert!(!screen.contains("\u{2665} Plain Song"), "{screen}");
+        assert!(screen.contains("Plain Song"), "{screen}");
+    }
+
+    #[test]
+    fn the_picker_lists_new_playlist_and_only_writable_playlists() {
+        let t0 = Instant::now();
+        let mut app = App::new(t0);
+        app.view = View::Search;
+        app.apply(Msg::Me(Ok("me".into())), t0);
+        app.apply(
+            Msg::Results(Ok(vec![track("Wanted Song", &["A"], None)])),
+            t0,
+        );
+        let playlists = vec![
+            playlist("p1", "Road Trip", "me", Some(42)),
+            playlist("p2", "Today's Hits", "spotify", None),
+        ];
+        app.apply(
+            Msg::Playlists {
+                offset: 0,
+                result: Ok(page(playlists, 2)),
+            },
+            t0,
+        );
+        app.mode = Mode::Picker;
+        app.picker_track = Some(track("Wanted Song", &["A"], None));
+        app.picker_state.select(Some(0));
+        let screen = render(&mut app, t0);
+        assert!(screen.contains("Add \"Wanted Song\" to..."), "{screen}");
+        assert!(screen.contains("+ New playlist..."), "{screen}");
+        assert!(screen.contains("Road Trip  42 tracks"), "{screen}");
+        assert!(
+            !screen.contains("Today's Hits"),
+            "followed playlists are not offered:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_name_prompt_shows_what_has_been_typed() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.mode = Mode::NewPlaylist;
+        app.new_name = "Late Night Mix".into();
+        let screen = render(&mut app, now);
+        assert!(screen.contains("New playlist name"), "{screen}");
+        assert!(screen.contains("Late Night Mix"), "{screen}");
+    }
+
+    #[test]
+    fn a_pending_removal_prompt_is_visible_in_the_status_line() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.open_playlist = Some(playlist("p1", "Mix", "me", Some(1)));
+        app.view = View::PlaylistTracks;
+        app.apply(
+            Msg::PlaylistTracks {
+                id: "p1".into(),
+                offset: 0,
+                result: Ok(page(vec![track("Doomed", &["A"], None)], 1)),
+            },
+            now,
+        );
+        app.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('x'),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+        let screen = render(&mut app, now);
+        assert!(
+            screen.contains("Remove \"Doomed\" from Mix? Press x again"),
+            "{screen}"
+        );
     }
 
     #[test]
@@ -637,8 +874,10 @@ mod tests {
             uri: "spotify:playlist:p1".into(),
             items: Some(Count { total: 42 }),
             owner: Some(Owner {
+                id: Some("me".into()),
                 display_name: Some("Akhil".into()),
             }),
+            collaborative: false,
         };
         let followed = Playlist {
             id: "p2".into(),
@@ -646,8 +885,10 @@ mod tests {
             uri: "spotify:playlist:p2".into(),
             items: None,
             owner: Some(Owner {
+                id: Some("spotify".into()),
                 display_name: Some("Spotify".into()),
             }),
+            collaborative: false,
         };
         app.apply(
             Msg::Playlists {
@@ -675,6 +916,7 @@ mod tests {
             uri: "spotify:playlist:p1".into(),
             items: None,
             owner: None,
+            collaborative: false,
         });
         app.view = View::PlaylistTracks;
         let items = vec![track("Some Episode", &[], None)];
