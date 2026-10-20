@@ -54,13 +54,63 @@ pub struct Album {
     pub name: String,
 }
 
+/// A track, or a podcast episode inside a playlist (which has no artists or album).
 #[derive(Debug, Deserialize)]
 pub struct Track {
     pub uri: String,
     pub name: String,
     pub duration_ms: u64,
+    #[serde(default)]
     pub artists: Vec<Artist>,
-    pub album: Album,
+    pub album: Option<Album>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Playlist {
+    pub id: String,
+    pub name: String,
+    pub uri: String,
+    /// Track count. Spotify omits it for playlists the user neither owns nor collaborates on.
+    pub items: Option<Count>,
+    pub owner: Option<Owner>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Count {
+    pub total: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Owner {
+    pub display_name: Option<String>,
+}
+
+/// One page of a paged endpoint.
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub total: u32,
+    /// Entries Spotify returned for this page, including any dropped as null, so
+    /// the next offset stays correct.
+    pub fetched: u32,
+}
+
+const PAGE_SIZE: u32 = 50;
+
+#[derive(Deserialize)]
+struct Paged<T> {
+    items: Vec<T>,
+    total: u32,
+}
+
+#[derive(Deserialize)]
+struct SavedItem {
+    track: Track,
+}
+
+#[derive(Deserialize)]
+struct PlaylistEntry {
+    /// Null for tracks removed from Spotify's catalogue.
+    item: Option<Track>,
 }
 
 #[derive(Deserialize)]
@@ -136,12 +186,18 @@ impl Api {
             return Ok(resp);
         }
         let text = resp.text().await.unwrap_or_default();
+        // The fix goes first: the TUI shows one line and cuts off the long response body.
         let hint = if text.contains("NO_ACTIVE_DEVICE") {
-            "\nNo device is playing. Start one, then run `spotui transfer <device name>`."
+            Some("No device is playing. Start one, then run `spotui transfer <device name>`.")
+        } else if text.contains("Insufficient client scope") {
+            Some("Run `spotui login` again to grant the new permissions.")
         } else {
-            ""
+            None
         };
-        bail!("{method} {path} returned {status}: {text}{hint}")
+        match hint {
+            Some(hint) => bail!("{hint} ({method} {path} returned {status}: {text})"),
+            None => bail!("{method} {path} returned {status}: {text}"),
+        }
     }
 
     pub async fn me(&self) -> Result<Me> {
@@ -171,6 +227,25 @@ impl Api {
     /// Resumes playback, or starts `uri` when given.
     pub async fn play(&self, uri: Option<&str>) -> Result<()> {
         self.send(Method::PUT, "/me/player/play", &[], uri.map(play_body))
+            .await?;
+        Ok(())
+    }
+
+    /// Plays `uris` in order. Used where no playable context exists (Liked Songs).
+    pub async fn play_uris(&self, uris: &[String]) -> Result<()> {
+        let body = json!({ "uris": uris });
+        self.send(Method::PUT, "/me/player/play", &[], Some(body))
+            .await?;
+        Ok(())
+    }
+
+    /// Plays a playlist or album, starting at `from_track` when given.
+    pub async fn play_context(&self, context_uri: &str, from_track: Option<&str>) -> Result<()> {
+        let mut body = json!({ "context_uri": context_uri });
+        if let Some(uri) = from_track {
+            body["offset"] = json!({ "uri": uri });
+        }
+        self.send(Method::PUT, "/me/player/play", &[], Some(body))
             .await?;
         Ok(())
     }
@@ -210,6 +285,51 @@ impl Api {
         ];
         let resp = self.send(Method::GET, "/search", &params, None).await?;
         Ok(resp.json::<SearchResponse>().await?.tracks.items)
+    }
+
+    async fn paged<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        offset: u32,
+    ) -> Result<Paged<T>> {
+        let params = [
+            ("limit", PAGE_SIZE.to_string()),
+            ("offset", offset.to_string()),
+        ];
+        let resp = self.send(Method::GET, path, &params, None).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// Liked Songs. Needs the `user-library-read` scope.
+    pub async fn saved_tracks(&self, offset: u32) -> Result<Page<Track>> {
+        let page: Paged<SavedItem> = self.paged("/me/tracks", offset).await?;
+        Ok(Page {
+            fetched: page.items.len() as u32,
+            total: page.total,
+            items: page.items.into_iter().map(|saved| saved.track).collect(),
+        })
+    }
+
+    /// The user's playlists. Needs the `playlist-read-private` scope.
+    pub async fn playlists(&self, offset: u32) -> Result<Page<Playlist>> {
+        let page: Paged<Playlist> = self.paged("/me/playlists", offset).await?;
+        Ok(Page {
+            fetched: page.items.len() as u32,
+            total: page.total,
+            items: page.items,
+        })
+    }
+
+    /// Tracks of a playlist. Spotify answers 403 unless the user owns or collaborates on it.
+    pub async fn playlist_tracks(&self, id: &str, offset: u32) -> Result<Page<Track>> {
+        let page: Paged<PlaylistEntry> = self
+            .paged(&format!("/playlists/{id}/items"), offset)
+            .await?;
+        Ok(Page {
+            fetched: page.items.len() as u32,
+            total: page.total,
+            items: page.items.into_iter().filter_map(|e| e.item).collect(),
+        })
     }
 
     /// Appends a track or episode URI to the playback queue.
@@ -384,7 +504,7 @@ mod tests {
         );
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].uri, "spotify:track:abc");
-        assert_eq!(tracks[0].album.name, "RAM");
+        assert_eq!(tracks[0].album.as_ref().unwrap().name, "RAM");
     }
 
     #[tokio::test]
@@ -395,6 +515,119 @@ mod tests {
         assert!(
             raw.starts_with("POST /me/player/queue?uri=spotify%3Atrack%3Aabc "),
             "{raw}"
+        );
+    }
+
+    fn json_ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn saved_tracks_requests_a_page_and_unwraps_the_track() {
+        let body = r#"{"total":120,"limit":50,"offset":50,"next":"x","items":[
+            {"added_at":"2026-01-01T00:00:00Z","track":{"uri":"spotify:track:a","name":"A",
+             "duration_ms":1000,"artists":[{"name":"X"}],"album":{"name":"Alb"}}}]}"#;
+        let (api, request) = serve_once(json_ok(body)).await;
+        let page = api.saved_tracks(50).await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(
+            raw.starts_with("GET /me/tracks?limit=50&offset=50 "),
+            "{raw}"
+        );
+        assert_eq!((page.total, page.fetched), (120, 1));
+        assert_eq!(page.items[0].uri, "spotify:track:a");
+    }
+
+    #[tokio::test]
+    async fn playlists_parse_with_and_without_a_track_count() {
+        let body = r#"{"total":2,"items":[
+            {"id":"p1","name":"Mine","uri":"spotify:playlist:p1","items":{"href":"h","total":42},
+             "tracks":{"href":"h","total":42},"owner":{"id":"me","display_name":"Akhil"}},
+            {"id":"p2","name":"Followed","uri":"spotify:playlist:p2","owner":{"id":"x","display_name":null}}]}"#;
+        let (api, request) = serve_once(json_ok(body)).await;
+        let page = api.playlists(0).await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(
+            raw.starts_with("GET /me/playlists?limit=50&offset=0 "),
+            "{raw}"
+        );
+        assert_eq!(page.items[0].items.as_ref().unwrap().total, 42);
+        assert!(page.items[1].items.is_none());
+    }
+
+    #[tokio::test]
+    async fn playlist_tracks_keep_episodes_and_drop_null_items() {
+        let body = r#"{"total":3,"items":[
+            {"added_at":null,"item":{"uri":"spotify:track:a","name":"A","duration_ms":1,
+             "artists":[{"name":"X"}],"album":{"name":"Alb"},"type":"track"}},
+            {"added_at":null,"item":{"uri":"spotify:episode:e","name":"Ep","duration_ms":2,"type":"episode"}},
+            {"added_at":null,"item":null}]}"#;
+        let (api, request) = serve_once(json_ok(body)).await;
+        let page = api.playlist_tracks("abc", 0).await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(
+            raw.starts_with("GET /playlists/abc/items?limit=50&offset=0 "),
+            "{raw}"
+        );
+        assert_eq!((page.items.len(), page.fetched, page.total), (2, 3, 3));
+        assert!(page.items[1].artists.is_empty() && page.items[1].album.is_none());
+    }
+
+    #[tokio::test]
+    async fn play_context_starts_at_the_given_track() {
+        let (api, request) = serve_once(NO_CONTENT).await;
+        api.play_context("spotify:playlist:p1", Some("spotify:track:a"))
+            .await
+            .unwrap();
+        let raw = request.await.unwrap();
+        assert!(raw.starts_with("PUT /me/player/play "), "{raw}");
+        assert!(
+            raw.ends_with(
+                r#"{"context_uri":"spotify:playlist:p1","offset":{"uri":"spotify:track:a"}}"#
+            ),
+            "{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_context_without_a_track_sends_no_offset() {
+        let (api, request) = serve_once(NO_CONTENT).await;
+        api.play_context("spotify:playlist:p1", None).await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(
+            raw.ends_with(r#"{"context_uri":"spotify:playlist:p1"}"#),
+            "{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_uris_sends_the_list_in_order() {
+        let (api, request) = serve_once(NO_CONTENT).await;
+        let uris = vec!["spotify:track:a".to_string(), "spotify:track:b".to_string()];
+        api.play_uris(&uris).await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(
+            raw.ends_with(r#"{"uris":["spotify:track:a","spotify:track:b"]}"#),
+            "{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_scope_error_tells_the_user_to_log_in_again() {
+        let body = r#"{"error":{"status":403,"message":"Insufficient client scope"}}"#;
+        let (api, _request) = serve_once(format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        let err = api.saved_tracks(0).await.err().unwrap().to_string();
+        assert!(err.starts_with("Run `spotui login` again"), "{err}");
+        assert!(
+            err.contains("403"),
+            "the raw response stays available: {err}"
         );
     }
 
@@ -414,6 +647,7 @@ mod tests {
         .await;
         let err = api.pause().await.unwrap_err().to_string();
         assert!(err.contains("404"), "{err}");
+        assert!(err.starts_with("No device is playing"), "{err}");
         assert!(err.contains("spotui transfer"), "{err}");
     }
 }

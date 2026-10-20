@@ -14,11 +14,15 @@ fn format_ms(ms: u64) -> String {
 
 fn format_track(number: usize, track: &api::Track) -> String {
     let artists: Vec<&str> = track.artists.iter().map(|a| a.name.as_str()).collect();
+    let album = track
+        .album
+        .as_ref()
+        .map(|a| format!(" ({})", a.name))
+        .unwrap_or_default();
     format!(
-        "{number:>2}. {} - {} ({}) {}\n    {}",
+        "{number:>2}. {} - {}{album} {}\n    {}",
         track.name,
         artists.join(", "),
-        track.album.name,
         format_ms(track.duration_ms),
         track.uri
     )
@@ -204,7 +208,7 @@ mod tests {
             artists: vec![Artist {
                 name: "Daft Punk".into(),
             }],
-            album: api::Album { name: "RAM".into() },
+            album: Some(api::Album { name: "RAM".into() }),
         };
         assert_eq!(
             format_track(1, &track),

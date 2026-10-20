@@ -13,8 +13,8 @@ use tokio::net::TcpListener;
 
 const AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
-const SCOPES: &str =
-    "user-read-playback-state user-modify-playback-state user-read-currently-playing";
+const SCOPES: &str = "user-read-playback-state user-modify-playback-state \
+                      user-read-currently-playing user-library-read playlist-read-private";
 const UNRESERVED: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
 /// Refresh this many seconds before the access token actually expires.
 const EXPIRY_MARGIN_SECS: u64 = 60;
@@ -317,6 +317,14 @@ mod tests {
         let line = "GET /callback?error=access_denied&state=st HTTP/1.1";
         let err = parse_callback(line, "st").unwrap_err().to_string();
         assert!(err.contains("access_denied"), "{err}");
+    }
+
+    #[test]
+    fn scopes_cover_library_and_playlist_reads_with_single_space_separators() {
+        let scopes: Vec<&str> = SCOPES.split(' ').collect();
+        assert!(scopes.contains(&"user-library-read"));
+        assert!(scopes.contains(&"playlist-read-private"));
+        assert!(scopes.iter().all(|s| !s.is_empty()), "{SCOPES:?}");
     }
 
     #[test]

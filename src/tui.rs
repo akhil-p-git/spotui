@@ -8,31 +8,47 @@ use ratatui::crossterm::event::{self, Event};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-use crate::api::Api;
-use crate::app::{Action, App, Mode, Msg};
+use crate::api::{Api, Track};
+use crate::app::{Action, App, Listing, MENU, Mode, Msg, View};
 use crate::{auth, format_ms};
 
-const HELP: &str =
-    "/ search  enter play  a queue  space pause  n/p skip  +/- vol  d device  q quit";
+/// Key hints for the current screen, each short enough for an 80-column terminal.
+fn help(view: View) -> &'static str {
+    match view {
+        View::Menu => "up/down move  right open  / search  space pause  n/p skip  d device  q quit",
+        View::Search | View::Liked => {
+            "left back  enter play  a queue  / search  space pause  n/p skip  +/- vol  q quit"
+        }
+        View::Playlists => {
+            "left back  right open  P play playlist  / search  space pause  n/p skip  q quit"
+        }
+        View::PlaylistTracks => {
+            "left back  enter play  a queue  P play all  space pause  n/p skip  q quit"
+        }
+    }
+}
 const POLL_EVERY_TICKS: u32 = 5;
 /// Spotify reports the old state if asked immediately after a command.
 const SETTLE_DELAY: Duration = Duration::from_millis(400);
 
 pub fn draw(frame: &mut Frame, app: &mut App, now: Instant) {
+    let search_height = if app.view == View::Search { 3 } else { 0 };
     let [search_area, list_area, now_area, status_area] = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(search_height),
         Constraint::Min(3),
         Constraint::Length(4),
         Constraint::Length(1),
     ])
     .areas(frame.area());
 
-    draw_search(frame, app, search_area);
-    draw_results(frame, app, list_area);
+    if app.view == View::Search {
+        draw_search(frame, app, search_area);
+    }
+    draw_main(frame, app, list_area);
     draw_now_playing(frame, app, now_area, now);
     draw_status(frame, app, status_area);
     if app.mode == Mode::Devices {
@@ -57,39 +73,153 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
-    let block = Block::bordered().title(" Results ");
-    if app.results.is_empty() {
-        frame.render_widget(
-            Paragraph::new("Press / to search for tracks.").block(block),
-            area,
-        );
-        return;
-    }
-    let items: Vec<ListItem> = app
-        .results
+fn dim(text: String) -> Span<'static> {
+    Span::styled(text, Style::new().fg(Color::DarkGray))
+}
+
+fn track_items(tracks: &[Track]) -> Vec<ListItem<'static>> {
+    tracks
         .iter()
         .map(|t| {
             let artists: Vec<&str> = t.artists.iter().map(|a| a.name.as_str()).collect();
+            let mut details = Vec::new();
+            if !artists.is_empty() {
+                details.push(artists.join(", "));
+            }
+            if let Some(album) = &t.album {
+                details.push(album.name.clone());
+            }
+            details.push(format_ms(t.duration_ms));
             ListItem::new(Line::from(vec![
                 Span::raw(t.name.clone()),
-                Span::styled(
-                    format!(
-                        "  {}  {}  {}",
-                        artists.join(", "),
-                        t.album.name,
-                        format_ms(t.duration_ms)
-                    ),
-                    Style::new().fg(Color::DarkGray),
-                ),
+                dim(format!("  {}", details.join("  "))),
             ]))
         })
-        .collect();
+        .collect()
+}
+
+/// Draws `items` as a selectable list, or `empty` when there is nothing to show.
+fn draw_list(
+    frame: &mut Frame,
+    area: Rect,
+    title: String,
+    items: Vec<ListItem<'static>>,
+    state: &mut ListState,
+    empty: &str,
+) {
+    let block = Block::bordered().title(title);
+    if items.is_empty() {
+        frame.render_widget(Paragraph::new(empty.to_string()).block(block), area);
+        return;
+    }
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
-    frame.render_stateful_widget(list, area, &mut app.results_state);
+    frame.render_stateful_widget(list, area, state);
+}
+
+/// What to show in place of a list that has no rows.
+fn empty<T>(listing: &Listing<T>, idle: &'static str) -> &'static str {
+    if listing.loading {
+        "Loading..."
+    } else if !listing.loaded {
+        "Could not load this list. Press left, then right to retry."
+    } else {
+        idle
+    }
+}
+
+fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
+    match app.view {
+        View::Menu => {
+            let items = MENU.iter().map(|entry| ListItem::new(*entry)).collect();
+            draw_list(
+                frame,
+                area,
+                " Library ".into(),
+                items,
+                &mut app.menu_state,
+                "",
+            );
+        }
+        View::Search => draw_list(
+            frame,
+            area,
+            " Results ".into(),
+            track_items(&app.results),
+            &mut app.results_state,
+            "Press / to search for tracks.",
+        ),
+        View::Liked => {
+            let none = empty(&app.liked, "No liked songs.");
+            draw_list(
+                frame,
+                area,
+                format!(
+                    " Liked Songs ({}/{}) ",
+                    app.liked.items.len(),
+                    app.liked.total
+                ),
+                track_items(&app.liked.items),
+                &mut app.liked.state,
+                none,
+            );
+        }
+        View::Playlists => {
+            let items = app
+                .playlists
+                .items
+                .iter()
+                .map(|p| {
+                    let count = p.items.as_ref().map(|c| format!("  {} tracks", c.total));
+                    let owner = p
+                        .owner
+                        .as_ref()
+                        .and_then(|o| o.display_name.as_ref())
+                        .map(|name| format!("  by {name}"));
+                    ListItem::new(Line::from(vec![
+                        Span::raw(p.name.clone()),
+                        dim(format!(
+                            "{}{}",
+                            count.unwrap_or_default(),
+                            owner.unwrap_or_default()
+                        )),
+                    ]))
+                })
+                .collect();
+            let none = empty(&app.playlists, "No playlists.");
+            draw_list(
+                frame,
+                area,
+                format!(
+                    " Playlists ({}/{}) ",
+                    app.playlists.items.len(),
+                    app.playlists.total
+                ),
+                items,
+                &mut app.playlists.state,
+                none,
+            );
+        }
+        View::PlaylistTracks => {
+            let name = app.open_playlist.as_ref().map_or("Playlist", |p| &p.name);
+            let title = format!(
+                " {name} ({}/{}) ",
+                app.playlist_tracks.items.len(),
+                app.playlist_tracks.total
+            );
+            let none = empty(&app.playlist_tracks, "No tracks to show.");
+            draw_list(
+                frame,
+                area,
+                title,
+                track_items(&app.playlist_tracks.items),
+                &mut app.playlist_tracks.state,
+                none,
+            );
+        }
+    }
 }
 
 fn draw_now_playing(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
@@ -155,7 +285,7 @@ fn draw_now_playing(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let paragraph = if app.status.is_empty() {
-        Paragraph::new(HELP).style(Style::new().fg(Color::DarkGray))
+        Paragraph::new(help(app.view)).style(Style::new().fg(Color::DarkGray))
     } else if app.status_is_error {
         Paragraph::new(app.status.as_str()).style(Style::new().fg(Color::Red))
     } else {
@@ -243,6 +373,28 @@ impl Ctx {
             Action::LoadDevices => {
                 self.spawn(|api| async move { Msg::Devices(api.devices().await.map_err(err)) })
             }
+            Action::LoadLiked { offset } => self.spawn(move |api| async move {
+                Msg::Liked {
+                    offset,
+                    result: api.saved_tracks(offset).await.map_err(err),
+                }
+            }),
+            Action::LoadPlaylists { offset } => self.spawn(move |api| async move {
+                Msg::Playlists {
+                    offset,
+                    result: api.playlists(offset).await.map_err(err),
+                }
+            }),
+            Action::LoadPlaylistTracks { id, offset } => self.spawn(move |api| async move {
+                let result = api.playlist_tracks(&id, offset).await.map_err(err);
+                Msg::PlaylistTracks { id, offset, result }
+            }),
+            Action::PlayUris(uris) => {
+                self.control(move |api| async move { api.play_uris(&uris).await })
+            }
+            Action::PlayContext { context_uri, from } => self.control(move |api| async move {
+                api.play_context(&context_uri, from.as_deref()).await
+            }),
             Action::Play(uri) => self.control(move |api| async move { api.play(Some(&uri)).await }),
             Action::Pause => self.control(|api| async move { api.pause().await }),
             Action::Resume => self.control(|api| async move { api.play(None).await }),
@@ -335,7 +487,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::api::{Album, Artist, Device, Item, Playback, Track};
+    use crate::api::{Album, Artist, Count, Device, Item, Owner, Page, Playback, Playlist, Track};
 
     fn render(app: &mut App, now: Instant) -> String {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -359,28 +511,192 @@ mod tests {
         }
     }
 
+    fn track(name: &str, artists: &[&str], album: Option<&str>) -> Track {
+        Track {
+            uri: format!("spotify:track:{name}"),
+            name: name.into(),
+            duration_ms: 185_000,
+            artists: artists
+                .iter()
+                .map(|a| Artist {
+                    name: (*a).to_string(),
+                })
+                .collect(),
+            album: album.map(|a| Album { name: a.into() }),
+        }
+    }
+
+    fn page<T>(items: Vec<T>, total: u32) -> Page<T> {
+        let fetched = items.len() as u32;
+        Page {
+            items,
+            total,
+            fetched,
+        }
+    }
+
     #[test]
-    fn empty_state_shows_search_hint_and_key_help() {
+    fn start_screen_is_the_library_menu_with_key_help() {
         let now = Instant::now();
         let screen = render(&mut App::new(now), now);
-        assert!(screen.contains("Press / to search for tracks."), "{screen}");
+        for entry in ["Library", "Search", "Liked Songs", "Playlists"] {
+            assert!(screen.contains(entry), "{entry} missing:\n{screen}");
+        }
         assert!(screen.contains("Nothing playing"), "{screen}");
         assert!(screen.contains("q quit"), "{screen}");
+        assert!(
+            !screen.contains("Search (/)"),
+            "search box only on the search view"
+        );
+    }
+
+    #[test]
+    fn search_view_shows_the_search_box_and_hint() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.view = View::Search;
+        let screen = render(&mut app, now);
+        assert!(screen.contains("Search (/)"), "{screen}");
+        assert!(screen.contains("Press / to search for tracks."), "{screen}");
+    }
+
+    #[test]
+    fn every_help_line_fits_an_80_column_terminal() {
+        for view in [
+            View::Menu,
+            View::Search,
+            View::Liked,
+            View::Playlists,
+            View::PlaylistTracks,
+        ] {
+            let len = help(view).chars().count();
+            assert!(len <= 80, "{view:?} help is {len} columns");
+        }
+    }
+
+    #[test]
+    fn liked_songs_show_loaded_and_total_counts() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.view = View::Liked;
+        let tracks = vec![track("Song A", &["Artist"], Some("Album"))];
+        app.apply(
+            Msg::Liked {
+                offset: 0,
+                result: Ok(page(tracks, 812)),
+            },
+            now,
+        );
+        let screen = render(&mut app, now);
+        assert!(screen.contains("Liked Songs (1/812)"), "{screen}");
+        assert!(screen.contains("Song A"), "{screen}");
+        assert!(screen.contains("Artist  Album  3:05"), "{screen}");
+    }
+
+    #[test]
+    fn a_failed_load_says_so_and_shows_the_fix_before_the_cut_off_response() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.view = View::Liked;
+        let long_error = format!(
+            "Run `spotui login` again to grant the new permissions. \
+             (GET /me/tracks returned 403 Forbidden: {})",
+            "x".repeat(200)
+        );
+        app.apply(
+            Msg::Liked {
+                offset: 0,
+                result: Err(long_error),
+            },
+            now,
+        );
+        let screen = render(&mut app, now);
+        assert!(screen.contains("Could not load this list"), "{screen}");
+        assert!(screen.contains("Run `spotui login` again"), "{screen}");
+        assert!(!screen.contains("No liked songs."), "{screen}");
+    }
+
+    #[test]
+    fn liked_songs_say_loading_until_the_first_page_arrives() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.view = View::Liked;
+        app.liked.loading = true;
+        let screen = render(&mut app, now);
+        assert!(screen.contains("Loading..."), "{screen}");
+    }
+
+    #[test]
+    fn playlists_show_counts_and_owners_and_omit_unknown_counts() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.view = View::Playlists;
+        let owned = Playlist {
+            id: "p1".into(),
+            name: "Road Trip".into(),
+            uri: "spotify:playlist:p1".into(),
+            items: Some(Count { total: 42 }),
+            owner: Some(Owner {
+                display_name: Some("Akhil".into()),
+            }),
+        };
+        let followed = Playlist {
+            id: "p2".into(),
+            name: "Today's Hits".into(),
+            uri: "spotify:playlist:p2".into(),
+            items: None,
+            owner: Some(Owner {
+                display_name: Some("Spotify".into()),
+            }),
+        };
+        app.apply(
+            Msg::Playlists {
+                offset: 0,
+                result: Ok(page(vec![owned, followed], 2)),
+            },
+            now,
+        );
+        let screen = render(&mut app, now);
+        assert!(screen.contains("Playlists (2/2)"), "{screen}");
+        assert!(
+            screen.contains("Road Trip  42 tracks  by Akhil"),
+            "{screen}"
+        );
+        assert!(screen.contains("Today's Hits  by Spotify"), "{screen}");
+    }
+
+    #[test]
+    fn playlist_view_is_titled_with_the_playlist_and_lists_episodes_without_artist_or_album() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.open_playlist = Some(Playlist {
+            id: "p1".into(),
+            name: "Mix".into(),
+            uri: "spotify:playlist:p1".into(),
+            items: None,
+            owner: None,
+        });
+        app.view = View::PlaylistTracks;
+        let items = vec![track("Some Episode", &[], None)];
+        app.apply(
+            Msg::PlaylistTracks {
+                id: "p1".into(),
+                offset: 0,
+                result: Ok(page(items, 1)),
+            },
+            now,
+        );
+        let screen = render(&mut app, now);
+        assert!(screen.contains("Mix (1/1)"), "{screen}");
+        assert!(screen.contains("Some Episode  3:05"), "{screen}");
     }
 
     #[test]
     fn results_and_now_playing_are_drawn() {
         let t0 = Instant::now();
         let mut app = App::new(t0);
-        let track = Track {
-            uri: "spotify:track:x".into(),
-            name: "Get Lucky".into(),
-            duration_ms: 369_000,
-            artists: vec![Artist {
-                name: "Daft Punk".into(),
-            }],
-            album: Album { name: "RAM".into() },
-        };
+        app.view = View::Search;
+        let track = track("Get Lucky", &["Daft Punk"], Some("RAM"));
         app.apply(Msg::Results(Ok(vec![track])), t0);
         let playback = Playback {
             is_playing: true,
