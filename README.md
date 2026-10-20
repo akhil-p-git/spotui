@@ -185,3 +185,7 @@ cargo fmt --check
 | `src/app.rs` | UI state and key handling, with no terminal or network access |
 | `src/tui.rs` | Drawing with ratatui and the event loop that runs API calls in the background |
 | `src/main.rs` | The command-line entry point |
+
+## License
+
+MIT. See [LICENSE](LICENSE).
