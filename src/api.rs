@@ -91,9 +91,19 @@ pub struct Api {
 
 impl Api {
     pub fn new(token: String) -> Self {
-        Self::with_base(token, API_BASE.to_string())
+        Self::with_client(reqwest::Client::new(), token)
     }
 
+    /// Reuses `http` so a long-running caller keeps one connection pool.
+    pub fn with_client(http: reqwest::Client, token: String) -> Self {
+        Self {
+            http,
+            token,
+            base: API_BASE.to_string(),
+        }
+    }
+
+    #[cfg(test)]
     fn with_base(token: String, base: String) -> Self {
         Self {
             http: reqwest::Client::new(),

@@ -1,9 +1,11 @@
 mod api;
+mod app;
 mod auth;
+mod tui;
 
 use anyhow::{Context, Result, bail};
 
-const USAGE: &str = "usage: spotui <login|whoami|devices|now|play [uri]|pause|next|prev|volume <0-100>|transfer <device name>|search <query>|queue <uri>>";
+const USAGE: &str = "usage: spotui [tui] | spotui <login|whoami|devices|now|play [uri]|pause|next|prev|volume <0-100>|transfer <device name>|search <query>|queue <uri>>";
 
 fn format_ms(ms: u64) -> String {
     let secs = ms / 1000;
@@ -64,6 +66,9 @@ async fn main() -> Result<()> {
 
     if command == "login" {
         return auth::login(&config).await;
+    }
+    if command.is_empty() || command == "tui" {
+        return tui::run(config).await;
     }
     if !matches!(
         command.as_str(),
