@@ -40,9 +40,42 @@ pub struct Item {
     pub artists: Vec<Artist>,
 }
 
+/// Spotify's repeat modes: `context` repeats the playlist or album, `track` the current song.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Repeat {
+    #[default]
+    Off,
+    Context,
+    Track,
+}
+
+impl Repeat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Repeat::Off => "off",
+            Repeat::Context => "context",
+            Repeat::Track => "track",
+        }
+    }
+
+    /// The mode after this one in the cycle off, all, one.
+    pub fn next(self) -> Self {
+        match self {
+            Repeat::Off => Repeat::Context,
+            Repeat::Context => Repeat::Track,
+            Repeat::Track => Repeat::Off,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Playback {
     pub is_playing: bool,
+    #[serde(default)]
+    pub shuffle_state: bool,
+    #[serde(default)]
+    pub repeat_state: Repeat,
     pub progress_ms: Option<u64>,
     pub device: Option<Device>,
     /// Null between tracks and during ads.
@@ -279,6 +312,28 @@ impl Api {
 
     pub async fn previous(&self) -> Result<()> {
         self.send(Method::POST, "/me/player/previous", &[], None)
+            .await?;
+        Ok(())
+    }
+
+    /// Jumps to `position_ms` in the current track.
+    pub async fn seek(&self, position_ms: u64) -> Result<()> {
+        let query = [("position_ms", position_ms.to_string())];
+        self.send(Method::PUT, "/me/player/seek", &query, None)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_shuffle(&self, on: bool) -> Result<()> {
+        let query = [("state", on.to_string())];
+        self.send(Method::PUT, "/me/player/shuffle", &query, None)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_repeat(&self, mode: Repeat) -> Result<()> {
+        let query = [("state", mode.as_str().to_string())];
+        self.send(Method::PUT, "/me/player/repeat", &query, None)
             .await?;
         Ok(())
     }
@@ -553,6 +608,33 @@ mod tests {
         let raw = request.await.unwrap();
         assert!(
             raw.starts_with("PUT /me/player/volume?volume_percent=40 "),
+            "{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seek_shuffle_and_repeat_send_their_state_in_the_query() {
+        let (api, request) = serve_once(NO_CONTENT).await;
+        api.seek(0).await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(
+            raw.starts_with("PUT /me/player/seek?position_ms=0 "),
+            "{raw}"
+        );
+
+        let (api, request) = serve_once(NO_CONTENT).await;
+        api.set_shuffle(true).await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(
+            raw.starts_with("PUT /me/player/shuffle?state=true "),
+            "{raw}"
+        );
+
+        let (api, request) = serve_once(NO_CONTENT).await;
+        api.set_repeat(Repeat::Context).await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(
+            raw.starts_with("PUT /me/player/repeat?state=context "),
             "{raw}"
         );
     }

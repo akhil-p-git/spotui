@@ -5,7 +5,7 @@ mod tui;
 
 use anyhow::{Context, Result, bail};
 
-const USAGE: &str = "usage: spotui [tui] | spotui <login|whoami|devices|now|play [uri]|pause|next|prev|volume <0-100>|transfer <device name>|search <query>|queue <uri>>";
+const USAGE: &str = "usage: spotui [tui] | spotui <login|whoami|devices|now|play [uri]|pause|next|prev|restart|shuffle <on|off>|repeat <off|all|one>|volume <0-100>|transfer <device name>|search <query>|queue <uri>>";
 
 fn format_ms(ms: u64) -> String {
     let secs = ms / 1000;
@@ -83,6 +83,9 @@ async fn main() -> Result<()> {
             | "pause"
             | "next"
             | "prev"
+            | "restart"
+            | "shuffle"
+            | "repeat"
             | "volume"
             | "transfer"
             | "search"
@@ -133,6 +136,24 @@ async fn main() -> Result<()> {
         "pause" => api.pause().await?,
         "next" => api.next().await?,
         "prev" => api.previous().await?,
+        "restart" => api.seek(0).await?,
+        "shuffle" => {
+            let on = match arg.as_deref() {
+                Some("on") => true,
+                Some("off") => false,
+                _ => bail!("shuffle takes on or off"),
+            };
+            api.set_shuffle(on).await?;
+        }
+        "repeat" => {
+            let mode = match arg.as_deref() {
+                Some("off") => api::Repeat::Off,
+                Some("all") => api::Repeat::Context,
+                Some("one") => api::Repeat::Track,
+                _ => bail!("repeat takes off, all or one"),
+            };
+            api.set_repeat(mode).await?;
+        }
         "volume" => {
             let percent: u8 = arg
                 .as_deref()
@@ -179,6 +200,8 @@ mod tests {
         assert_eq!(describe(None), "Nothing playing.");
         let p = Playback {
             is_playing: true,
+            shuffle_state: false,
+            repeat_state: api::Repeat::Off,
             progress_ms: Some(83_000),
             device: Some(Device {
                 id: Some("d".into()),
@@ -220,6 +243,8 @@ mod tests {
     fn describe_handles_missing_item() {
         let p = Playback {
             is_playing: false,
+            shuffle_state: false,
+            repeat_state: api::Repeat::Off,
             progress_ms: None,
             device: None,
             item: None,

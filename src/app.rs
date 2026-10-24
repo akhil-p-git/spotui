@@ -7,7 +7,7 @@ use std::time::Instant;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 
-use crate::api::{Count, Device, Page, Playback, Playlist, Track};
+use crate::api::{Count, Device, Page, Playback, Playlist, Repeat, Track};
 
 const VOLUME_STEP: u8 = 5;
 /// Tracks sent in one `uris` play request when starting from Liked Songs.
@@ -42,6 +42,9 @@ pub enum Action {
     Resume,
     Next,
     Previous,
+    Restart,
+    Shuffle(bool),
+    Repeat(Repeat),
     Volume(u8),
     Transfer(String),
     LoadDevices,
@@ -142,6 +145,8 @@ pub enum Mode {
     Picker,
     /// Typing the name of a new playlist for `picker_track`.
     NewPlaylist,
+    /// The shortcut list; any of Esc, q, ?, Enter closes it.
+    Help,
 }
 
 /// Which screen fills the main area. Left/Right walk a stack of these.
@@ -590,6 +595,7 @@ impl App {
             Mode::Devices => self.devices_key(key.code),
             Mode::Picker => self.picker_key(key.code),
             Mode::NewPlaylist => self.new_playlist_key(key.code),
+            Mode::Help => self.help_key(key.code),
             Mode::Browse => self.browse_key(key.code),
         }
     }
@@ -818,13 +824,17 @@ impl App {
         match code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Esc if self.history.is_empty() => self.quit = true,
-            KeyCode::Esc | KeyCode::Left | KeyCode::Backspace => self.back(),
-            KeyCode::Right => return self.open_selected(),
+            KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('a') => self.back(),
+            KeyCode::Right | KeyCode::Char('d') => return self.open_selected(),
             KeyCode::Enter => return self.activate(),
-            KeyCode::Char('/') | KeyCode::Char('s') => return self.open(View::Search),
-            KeyCode::Down | KeyCode::Char('j') => return self.move_selection(1),
-            KeyCode::Up | KeyCode::Char('k') => return self.move_selection(-1),
-            KeyCode::Char('a') => {
+            KeyCode::Char('/') => return self.open(View::Search),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('s') => {
+                return self.move_selection(1);
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('w') => {
+                return self.move_selection(-1);
+            }
+            KeyCode::Char('e') => {
                 return self.selected_track().map(|t| Action::Queue {
                     uri: t.uri.clone(),
                     label: t.name.clone(),
@@ -844,17 +854,40 @@ impl App {
             }
             KeyCode::Char('n') => return Some(Action::Next),
             KeyCode::Char('p') => return Some(Action::Previous),
+            KeyCode::Char('r') => return Some(Action::Restart),
+            KeyCode::Char('z') => {
+                let on = self.playback.as_ref().is_some_and(|p| p.shuffle_state);
+                return Some(Action::Shuffle(!on));
+            }
+            KeyCode::Char('R') => {
+                let mode = self
+                    .playback
+                    .as_ref()
+                    .map_or(Repeat::Off, |p| p.repeat_state);
+                return Some(Action::Repeat(mode.next()));
+            }
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 return self.volume_change(VOLUME_STEP as i16);
             }
             KeyCode::Char('-') => return self.volume_change(-(VOLUME_STEP as i16)),
-            KeyCode::Char('d') => {
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('D') => {
                 self.mode = Mode::Devices;
                 self.devices.clear();
                 self.devices_state.select(None);
                 return Some(Action::LoadDevices);
             }
             _ => {}
+        }
+        None
+    }
+
+    fn help_key(&mut self, code: KeyCode) -> Option<Action> {
+        if matches!(
+            code,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')
+        ) {
+            self.mode = Mode::Browse;
         }
         None
     }
@@ -878,10 +911,10 @@ impl App {
 
     fn devices_key(&mut self, code: KeyCode) -> Option<Action> {
         match code {
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('s') => {
                 step(&mut self.devices_state, self.devices.len(), 1)
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('w') => {
                 step(&mut self.devices_state, self.devices.len(), -1)
             }
             KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Browse,
@@ -903,8 +936,12 @@ impl App {
     fn picker_key(&mut self, code: KeyCode) -> Option<Action> {
         let rows = self.picker_playlists().len() + 1;
         match code {
-            KeyCode::Down | KeyCode::Char('j') => step(&mut self.picker_state, rows, 1),
-            KeyCode::Up | KeyCode::Char('k') => step(&mut self.picker_state, rows, -1),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('s') => {
+                step(&mut self.picker_state, rows, 1)
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('w') => {
+                step(&mut self.picker_state, rows, -1)
+            }
             KeyCode::Esc => {
                 self.mode = Mode::Browse;
                 self.picker_track = None;
@@ -1030,6 +1067,8 @@ mod tests {
     fn playback(is_playing: bool, progress_ms: u64, volume: Option<u8>) -> Playback {
         Playback {
             is_playing,
+            shuffle_state: false,
+            repeat_state: Repeat::Off,
             progress_ms: Some(progress_ms),
             device: Some(device(Some("d1"), true, volume)),
             item: Some(Item {
@@ -1144,7 +1183,7 @@ mod tests {
             Some(Action::Play("spotify:track:two".into()))
         );
         assert_eq!(
-            app.on_key(key(KeyCode::Char('a'))),
+            app.on_key(key(KeyCode::Char('e'))),
             Some(Action::Queue {
                 uri: "spotify:track:two".into(),
                 label: "two".into()
@@ -1167,6 +1206,82 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Char(' '))), Some(Action::Resume));
         app.apply(Msg::Playback(Ok(Some(playback(true, 0, Some(50))))), now);
         assert_eq!(app.on_key(key(KeyCode::Char(' '))), Some(Action::Pause));
+    }
+
+    #[test]
+    fn wasd_moves_like_the_arrow_keys() {
+        let mut app = app_with_results();
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.results_state.selected(), Some(1));
+        app.on_key(key(KeyCode::Char('w')));
+        assert_eq!(app.results_state.selected(), Some(0));
+
+        let mut app = App::new(Instant::now());
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.view, View::Search);
+        app.mode = Mode::Browse;
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.view, View::Menu);
+    }
+
+    #[test]
+    fn question_mark_opens_help_and_esc_q_or_question_mark_close_it() {
+        let mut app = App::new(Instant::now());
+        for close in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('?')] {
+            assert_eq!(app.on_key(key(KeyCode::Char('?'))), None);
+            assert_eq!(app.mode, Mode::Help);
+            // Other keys do nothing while help is open.
+            assert_eq!(app.on_key(key(KeyCode::Char('n'))), None);
+            assert_eq!(app.mode, Mode::Help);
+            app.on_key(key(close));
+            assert_eq!(app.mode, Mode::Browse);
+            assert!(!app.quit);
+        }
+    }
+
+    #[test]
+    fn r_restarts_the_track() {
+        let mut app = App::new(Instant::now());
+        assert_eq!(app.on_key(key(KeyCode::Char('r'))), Some(Action::Restart));
+    }
+
+    #[test]
+    fn z_toggles_shuffle_from_the_reported_state() {
+        let mut app = App::new(Instant::now());
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('z'))),
+            Some(Action::Shuffle(true))
+        );
+        let mut p = playback(true, 0, None);
+        p.shuffle_state = true;
+        app.apply(Msg::Playback(Ok(Some(p))), Instant::now());
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('z'))),
+            Some(Action::Shuffle(false))
+        );
+    }
+
+    #[test]
+    fn shift_r_cycles_repeat_off_all_one_off() {
+        let mut app = App::new(Instant::now());
+        let next = |app: &mut App, from: Repeat| {
+            let mut p = playback(true, 0, None);
+            p.repeat_state = from;
+            app.apply(Msg::Playback(Ok(Some(p))), Instant::now());
+            app.on_key(key(KeyCode::Char('R')))
+        };
+        assert_eq!(
+            next(&mut app, Repeat::Off),
+            Some(Action::Repeat(Repeat::Context))
+        );
+        assert_eq!(
+            next(&mut app, Repeat::Context),
+            Some(Action::Repeat(Repeat::Track))
+        );
+        assert_eq!(
+            next(&mut app, Repeat::Track),
+            Some(Action::Repeat(Repeat::Off))
+        );
     }
 
     #[test]
@@ -1196,7 +1311,7 @@ mod tests {
         let now = Instant::now();
         let mut app = App::new(now);
         assert_eq!(
-            app.on_key(key(KeyCode::Char('d'))),
+            app.on_key(key(KeyCode::Char('D'))),
             Some(Action::LoadDevices)
         );
         assert_eq!(app.mode, Mode::Devices);
@@ -1218,7 +1333,7 @@ mod tests {
     fn device_without_id_cannot_be_transferred_to() {
         let now = Instant::now();
         let mut app = App::new(now);
-        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key(KeyCode::Char('D')));
         app.apply(Msg::Devices(Ok(vec![device(None, false, None)])), now);
         assert_eq!(app.on_key(key(KeyCode::Enter)), None);
         assert!(app.status_is_error);

@@ -13,22 +13,22 @@ use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, ListState, Paragraph
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-use crate::api::{Api, Track};
+use crate::api::{Api, Repeat, Track};
 use crate::app::{Action, App, Listing, MENU, Mode, Msg, View};
 use crate::{auth, format_ms};
 
 /// Key hints for the current screen, each short enough for an 80-column terminal.
 fn help(view: View) -> &'static str {
     match view {
-        View::Menu => "up/down move  right open  / search  space pause  n/p skip  d device  q quit",
+        View::Menu => "right open  / search  space pause  n/p skip  D device  ? help  q quit",
         View::Search | View::Liked => {
-            "left back  enter play  l like  A add  a queue  / search  space pause  q quit"
+            "left back  enter play  l like  A add  e queue  ? help  space pause  q quit"
         }
         View::Playlists => {
-            "left back  right open  P play playlist  / search  space pause  n/p skip  q quit"
+            "left back  right open  P play playlist  ? help  space pause  n/p skip  q quit"
         }
         View::PlaylistTracks => {
-            "left back  enter play  l like  A add  x remove  P play all  a queue  q quit"
+            "left back  enter play  l like  A add  x remove  P play all  e queue  q quit"
         }
     }
 }
@@ -56,6 +56,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, now: Instant) {
         Mode::Devices => draw_devices(frame, app),
         Mode::Picker => draw_picker(frame, app),
         Mode::NewPlaylist => draw_new_playlist(frame, app),
+        Mode::Help => draw_help(frame),
         Mode::Browse | Mode::Search => {}
     }
 }
@@ -288,7 +289,7 @@ fn draw_now_playing(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
 
     let Some(playback) = &app.playback else {
         frame.render_widget(
-            Paragraph::new("Nothing playing. Press d to pick a device."),
+            Paragraph::new("Nothing playing. Press D to pick a device."),
             text_area,
         );
         return;
@@ -317,8 +318,18 @@ fn draw_now_playing(frame: &mut Frame, app: &App, area: Rect, now: Instant) {
             None => format!("  [{}]", d.name),
         })
         .unwrap_or_default();
+    let shuffle = if playback.shuffle_state {
+        "  [shuffle]"
+    } else {
+        ""
+    };
+    let repeat = match playback.repeat_state {
+        Repeat::Off => "",
+        Repeat::Context => "  [repeat all]",
+        Repeat::Track => "  [repeat one]",
+    };
     frame.render_widget(
-        Paragraph::new(format!("{state}: {title}{device}")),
+        Paragraph::new(format!("{state}: {title}{device}{shuffle}{repeat}")),
         text_area,
     );
 
@@ -381,6 +392,61 @@ fn draw_devices(frame: &mut Frame, app: &mut App) {
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, area, &mut app.devices_state);
+}
+
+/// Every shortcut, as (keys, what it does). Keep in step with `App::browse_key`.
+const HELP_BROWSE: [(&str, &str); 11] = [
+    ("w s / k j", "Move up / down"),
+    ("d / right", "Open"),
+    ("a / left", "Back"),
+    ("/", "Search"),
+    ("enter", "Play track"),
+    ("P", "Play playlist"),
+    ("e", "Add to queue"),
+    ("l", "Like / unlike"),
+    ("A", "Add to a playlist"),
+    ("x x", "Remove from playlist"),
+    ("q", "Quit"),
+];
+const HELP_PLAYBACK: [(&str, &str); 8] = [
+    ("space", "Pause / resume"),
+    ("n p", "Next / previous"),
+    ("r", "Restart track"),
+    ("z", "Shuffle on / off"),
+    ("R", "Repeat off / all / one"),
+    ("+ -", "Volume"),
+    ("D", "Choose device"),
+    ("?", "This help"),
+];
+
+fn help_column(rows: &[(&str, &str)]) -> Vec<Line<'static>> {
+    rows.iter()
+        .map(|(keys, what)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{keys:<11}"),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(what.to_string()),
+            ])
+        })
+        .collect()
+}
+
+fn draw_help(frame: &mut Frame) {
+    let [area] = Layout::vertical([Constraint::Length(HELP_BROWSE.len() as u16 + 2)])
+        .flex(Flex::Center)
+        .areas(frame.area());
+    let [area] = Layout::horizontal([Constraint::Max(76)])
+        .flex(Flex::Center)
+        .areas(area);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered().title(" Shortcuts (esc close) ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [left, right] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(inner);
+    frame.render_widget(Paragraph::new(help_column(&HELP_BROWSE)), left);
+    frame.render_widget(Paragraph::new(help_column(&HELP_PLAYBACK)), right);
 }
 
 fn err(e: anyhow::Error) -> String {
@@ -524,6 +590,13 @@ impl Ctx {
             Action::Resume => self.control(|api| async move { api.play(None).await }),
             Action::Next => self.control(|api| async move { api.next().await }),
             Action::Previous => self.control(|api| async move { api.previous().await }),
+            Action::Restart => self.control(|api| async move { api.seek(0).await }),
+            Action::Shuffle(on) => {
+                self.control(move |api| async move { api.set_shuffle(on).await })
+            }
+            Action::Repeat(mode) => {
+                self.control(move |api| async move { api.set_repeat(mode).await })
+            }
             Action::Volume(percent) => {
                 self.control(move |api| async move { api.set_volume(percent).await })
             }
@@ -798,6 +871,24 @@ mod tests {
     }
 
     #[test]
+    fn the_help_screen_lists_the_shortcuts_within_80_columns() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.mode = Mode::Help;
+        let screen = render(&mut app, now);
+        for text in [
+            "Shortcuts",
+            "Move up / down",
+            "Quit",
+            "Pause / resume",
+            "Repeat off / all / one",
+            "This help",
+        ] {
+            assert!(screen.contains(text), "{text}\n{screen}");
+        }
+    }
+
+    #[test]
     fn every_help_line_fits_an_80_column_terminal() {
         for view in [
             View::Menu,
@@ -942,6 +1033,8 @@ mod tests {
         app.apply(Msg::Results(Ok(vec![track])), t0);
         let playback = Playback {
             is_playing: true,
+            shuffle_state: true,
+            repeat_state: Repeat::Track,
             progress_ms: Some(60_000),
             device: Some(sample_device()),
             item: Some(Item {
@@ -955,6 +1048,8 @@ mod tests {
         app.apply(Msg::Playback(Ok(Some(playback))), t0);
 
         let screen = render(&mut app, t0 + Duration::from_secs(5));
+        assert!(screen.contains("[shuffle]"), "{screen}");
+        assert!(screen.contains("[repeat one]"), "{screen}");
         assert!(screen.contains("Get Lucky"), "{screen}");
         assert!(screen.contains("RAM"), "{screen}");
         assert!(

@@ -106,30 +106,34 @@ spotui devices                            # should list "spotui"
 
 Finally play a first song:
 
-1. Run `spotui`, press `d`, and select the `spotui` device. This points playback at spotifyd but does not start any audio.
+1. Run `spotui`, press `D`, and select the `spotui` device. This points playback at spotifyd but does not start any audio.
 2. Press `/`, type a song name, and press `Enter`.
 3. Press `Enter` again on a result. The sound comes out of your computer's default audio output.
 
 ## Use
 
-`spotui` with no arguments opens the terminal UI. It starts on a Library menu with Search, Liked Songs and Playlists. **Right** goes into an entry and **Left** goes back.
+`spotui` with no arguments opens the terminal UI. It starts on a Library menu with Search, Liked Songs and Playlists. **Right** (or `d`) goes into an entry and **Left** (or `a`) goes back.
 
 | Key | Action |
 |---|---|
-| `Up` `Down` or `k` `j` | Move the selection. Long lists load the next page as you near the end. |
-| `Right` or `Enter` | Open the highlighted menu entry or playlist. |
-| `Left`, `Backspace` or `Esc` | Go back. `Esc` on the Library menu quits. |
-| `/` or `s` | Search. Type a query and press `Enter`; `Esc` cancels. |
+| `Up` `Down`, `k` `j` or `w` `s` | Move the selection. Long lists load the next page as you near the end. |
+| `Right`, `d` or `Enter` | Open the highlighted menu entry or playlist. |
+| `Left`, `a`, `Backspace` or `Esc` | Go back. `Esc` on the Library menu quits. |
+| `/` | Search. Type a query and press `Enter`; `Esc` cancels. |
 | `Enter` on a track | Play it. In Liked Songs this plays the next 50 loaded tracks. In a playlist it plays the playlist from that track. |
 | `P` | Play the highlighted or open playlist from its start. |
-| `a` | Add the track to the playback queue. |
+| `e` | Add the track to the playback queue. |
 | `l` | Like or unlike the track. A red ♥ marks liked tracks. |
 | `A` | Add the track to a playlist you own or collaborate on, or to a new private playlist. |
 | `x` | In a playlist, remove the track. Press `x` again to confirm; any other key cancels. |
 | `Space` | Pause or resume. |
 | `n` `p` | Next or previous track. |
+| `r` | Restart the current track. |
+| `z` | Turn shuffle on or off. |
+| `R` | Cycle repeat: off, all (playlist or album), one (current track). |
 | `+` `-` | Volume up or down by 5. |
-| `d` | Choose the playback device. |
+| `D` | Choose the playback device. |
+| `?` | Show every shortcut in the UI. |
 | `q` or `Ctrl-C` | Quit. |
 
 The same player controls work without the UI:
@@ -141,6 +145,9 @@ spotui search daft punk        # up to 10 tracks, each with its spotify:track: U
 spotui play spotify:track:0DiWol3AO6WpXZgp0goxAV
 spotui now                     # what is playing
 spotui pause                   # also: spotui next, spotui prev
+spotui restart                 # back to the start of the track
+spotui shuffle on              # on or off
+spotui repeat one              # off, all or one
 spotui volume 40               # 0 to 100
 spotui queue <uri>             # add a track or episode to the queue
 spotui whoami                  # show the logged-in account
@@ -166,7 +173,7 @@ Without a `bitrate` line, spotifyd streams at 160 kbps; its source falls back to
 | `Error: reading …/spotui/config.json` and `No such file or directory` | There is no config file. Create it as described in step 2. |
 | `no saved login at …/tokens.json; run spotui login` | You have not logged in yet. Run `spotui login`. |
 | `Run spotui login again to grant the new permissions.` | Your saved login predates a permission the feature needs. Run `spotui login`. |
-| `No device is playing. Start one, then run spotui transfer <device name>.` | No device is active. Start spotifyd, then run `spotui transfer spotui`, or press `d` in the UI. |
+| `No device is playing. Start one, then run spotui transfer <device name>.` | No device is active. Start spotifyd, then run `spotui transfer spotui`, or press `D` in the UI. |
 | `port 8888 is busy; set another port in config.json` | Another program uses the login port. Change `port` in `config.json` and add the matching redirect URI in the dashboard. |
 | `spotui devices` lists no `spotui` device | Run `systemctl --user status spotifyd` and `journalctl --user -u spotifyd -n 30` to see why spotifyd stopped. |
 
