@@ -395,7 +395,7 @@ fn draw_devices(frame: &mut Frame, app: &mut App) {
 }
 
 /// Every shortcut, as (keys, what it does). Keep in step with `App::browse_key`.
-const HELP_BROWSE: [(&str, &str); 11] = [
+const HELP_BROWSE: [(&str, &str); 12] = [
     ("w s / k j", "Move up / down"),
     ("d / right", "Open"),
     ("a / left", "Back"),
@@ -404,6 +404,7 @@ const HELP_BROWSE: [(&str, &str); 11] = [
     ("P", "Play playlist"),
     ("e", "Add to queue"),
     ("l", "Like / unlike"),
+    ("L", "Like / unlike playing"),
     ("A", "Add to a playlist"),
     ("x x", "Remove from playlist"),
     ("q", "Quit"),
@@ -1038,6 +1039,7 @@ mod tests {
             progress_ms: Some(60_000),
             device: Some(sample_device()),
             item: Some(Item {
+                uri: "spotify:track:omt".into(),
                 name: "One More Time".into(),
                 duration_ms: 320_000,
                 artists: vec![Artist {

@@ -34,6 +34,9 @@ pub struct Artist {
 /// A track or episode. Episodes carry no `artists`.
 #[derive(Debug, Deserialize)]
 pub struct Item {
+    /// Empty if Spotify omits it (not expected for tracks and episodes).
+    #[serde(default)]
+    pub uri: String,
     pub name: String,
     pub duration_ms: u64,
     #[serde(default)]
@@ -566,7 +569,7 @@ mod tests {
     fn playback_parses_track_and_episode_and_null_item() {
         let track = r#"{"is_playing":true,"progress_ms":83000,
             "device":{"id":"d1","is_active":true,"name":"spotifyd","type":"Computer","volume_percent":40},
-            "item":{"name":"Song","duration_ms":225000,"artists":[{"name":"A"},{"name":"B"}]}}"#;
+            "item":{"uri":"spotify:track:s","name":"Song","duration_ms":225000,"artists":[{"name":"A"},{"name":"B"}]}}"#;
         let p: Playback = serde_json::from_str(track).unwrap();
         assert_eq!(p.item.unwrap().artists.len(), 2);
 

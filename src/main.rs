@@ -211,6 +211,7 @@ mod tests {
                 volume_percent: Some(40),
             }),
             item: Some(Item {
+                uri: "spotify:track:s".into(),
                 name: "Song".into(),
                 duration_ms: 225_000,
                 artists: vec![Artist { name: "A".into() }, Artist { name: "B".into() }],

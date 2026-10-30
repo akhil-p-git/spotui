@@ -124,6 +124,7 @@ Finally play a first song:
 | `P` | Play the highlighted or open playlist from its start. |
 | `e` | Add the track to the playback queue. |
 | `l` | Like or unlike the track. A red ♥ marks liked tracks. |
+| `L` | Like or unlike the track that is playing, from any screen. |
 | `A` | Add the track to a playlist you own or collaborate on, or to a new private playlist. |
 | `x` | In a playlist, remove the track. Press `x` again to confirm; any other key cancels. |
 | `Space` | Pause or resume. |

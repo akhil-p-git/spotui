@@ -422,6 +422,10 @@ impl App {
             Msg::Playback(Ok(playback)) => {
                 self.playback = playback;
                 self.playback_at = now;
+                let uri = self.playing_uri()?;
+                if is_likeable(&uri) && !self.liked_flags.contains_key(&uri) {
+                    return Some(Action::CheckLiked(vec![uri]));
+                }
             }
             Msg::Results(Ok(tracks)) => {
                 self.results_state
@@ -714,6 +718,24 @@ impl App {
     fn toggle_like(&mut self) -> Option<Action> {
         let track = self.selected_track()?;
         let (uri, label) = (track.uri.clone(), track.name.clone());
+        self.like_action(uri, label)
+    }
+
+    /// `L`: like the track that is playing, or unlike it if it is already liked.
+    fn toggle_like_playing(&mut self) -> Option<Action> {
+        let Some(item) = self.playback.as_ref().and_then(|p| p.item.as_ref()) else {
+            self.error("Nothing is playing.");
+            return None;
+        };
+        let (uri, label) = (item.uri.clone(), item.name.clone());
+        self.like_action(uri, label)
+    }
+
+    fn playing_uri(&self) -> Option<String> {
+        Some(self.playback.as_ref()?.item.as_ref()?.uri.clone())
+    }
+
+    fn like_action(&mut self, uri: String, label: String) -> Option<Action> {
         if !is_likeable(&uri) {
             self.error("Only tracks and episodes can be liked.");
             return None;
@@ -841,6 +863,7 @@ impl App {
                 });
             }
             KeyCode::Char('l') => return self.toggle_like(),
+            KeyCode::Char('L') => return self.toggle_like_playing(),
             KeyCode::Char('A') => return self.open_picker(),
             KeyCode::Char('x') | KeyCode::Delete => return self.remove_selected(confirming),
             KeyCode::Char('P') => return self.play_playlist(),
@@ -1072,6 +1095,7 @@ mod tests {
             progress_ms: Some(progress_ms),
             device: Some(device(Some("d1"), true, volume)),
             item: Some(Item {
+                uri: "spotify:track:s".into(),
                 name: "S".into(),
                 duration_ms: 100_000,
                 artists: vec![],
@@ -1740,6 +1764,43 @@ mod tests {
                 liked: false,
                 label: "two".into()
             })
+        );
+    }
+
+    #[test]
+    fn shift_l_likes_the_playing_track_from_any_view() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        assert_eq!(app.on_key(key(KeyCode::Char('L'))), None);
+        assert!(app.status_is_error, "{}", app.status);
+
+        // The first poll asks whether the playing track is liked.
+        assert_eq!(
+            app.apply(Msg::Playback(Ok(Some(playback(true, 0, None)))), now),
+            Some(Action::CheckLiked(vec!["spotify:track:s".into()]))
+        );
+        assert_eq!(app.on_key(key(KeyCode::Char('L'))), None);
+        assert!(app.status.contains("Still checking"), "{}", app.status);
+
+        app.apply(
+            Msg::LikedFlags {
+                uris: vec!["spotify:track:s".into()],
+                result: Ok(vec![false]),
+            },
+            now,
+        );
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('L'))),
+            Some(Action::SetLiked {
+                uri: "spotify:track:s".into(),
+                liked: true,
+                label: "S".into()
+            })
+        );
+        // Known now, so the next poll asks nothing.
+        assert_eq!(
+            app.apply(Msg::Playback(Ok(Some(playback(true, 1, None)))), now),
+            None
         );
     }
 
