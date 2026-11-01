@@ -117,11 +117,12 @@ Finally play a first song:
 | Key | Action |
 |---|---|
 | `Up` `Down`, `k` `j` or `w` `s` | Move the selection. Long lists load the next page as you near the end. |
-| `Right`, `d` or `Enter` | Open the highlighted menu entry or playlist. |
+| `Right`, `d` or `Enter` | Open the highlighted menu entry, playlist, artist or album. |
 | `Left`, `a`, `Backspace` or `Esc` | Go back. `Esc` on the Library menu quits. |
-| `/` | Search. Type a query and press `Enter`; `Esc` cancels. |
-| `Enter` on a track | Play it. In Liked Songs this plays the next 50 loaded tracks. In a playlist it plays the playlist from that track. |
-| `P` | Play the highlighted or open playlist from its start. |
+| `/` | Search for artists and tracks. Type a query and press `Enter`; `Esc` cancels. Matching artists are listed above the tracks. |
+| `Enter` on a track | Play it. On the artist page it plays the songs from that one down. In an album it plays the album from that track. In Liked Songs this plays the next 50 loaded tracks. In a playlist it plays the playlist from that track. |
+| `g` | Open the page of the highlighted track's first artist. From an album you opened from that page, it goes back to the page. |
+| `P` | Play the highlighted or open playlist or album from its start. |
 | `e` | Add the track to the playback queue. |
 | `l` | Like or unlike the track. A red ♥ marks liked tracks. |
 | `L` | Like or unlike the track that is playing, from any screen. |
@@ -158,7 +159,8 @@ spotui whoami                  # show the logged-in account
 
 ### Limits
 
-- Search returns at most 10 tracks. Spotify caps `limit` at 10 for Development Mode apps.
+- An artist page shows "top matches", not a top-tracks list. Spotify removed its top-tracks endpoint and the `popularity` field in February 2026, so spotui searches for the artist's name and keeps tracks by that artist, in Spotify's relevance order. Albums and singles come from Spotify's artist-albums endpoint, 10 per page, and load more as you scroll.
+- Search returns at most 10 artists and 10 tracks. Spotify caps `limit` at 10 for Development Mode apps.
 - Spotify lists the tracks of a playlist only if you own it or collaborate on it. For any other playlist spotui shows an explanation instead. Pressing `P` on one asks Spotify to play it; whether Spotify allows that for playlists you only follow has not been tested.
 - The track count in the playlist list can lag behind a change you just made. Opening the playlist shows the real contents.
 - spotui cannot rename, reorder or delete playlists.

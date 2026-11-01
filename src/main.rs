@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
             if query.is_empty() {
                 bail!("search takes a query, e.g. `spotui search daft punk`");
             }
-            let tracks = api.search_tracks(&query, 0).await?;
+            let tracks = api.search(&query, 0).await?.tracks;
             if tracks.is_empty() {
                 println!("No tracks found.");
             }
@@ -214,7 +214,16 @@ mod tests {
                 uri: "spotify:track:s".into(),
                 name: "Song".into(),
                 duration_ms: 225_000,
-                artists: vec![Artist { name: "A".into() }, Artist { name: "B".into() }],
+                artists: vec![
+                    Artist {
+                        id: "a".into(),
+                        name: "A".into(),
+                    },
+                    Artist {
+                        id: "b".into(),
+                        name: "B".into(),
+                    },
+                ],
             }),
         };
         assert_eq!(
@@ -230,6 +239,7 @@ mod tests {
             name: "Get Lucky".into(),
             duration_ms: 369_000,
             artists: vec![Artist {
+                id: "dp".into(),
                 name: "Daft Punk".into(),
             }],
             album: Some(api::Album { name: "RAM".into() }),

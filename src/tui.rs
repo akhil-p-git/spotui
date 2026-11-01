@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, ListState, Paragraph
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-use crate::api::{Api, Repeat, Track};
+use crate::api::{Api, ArtistAlbum, Repeat, Track};
 use crate::app::{Action, App, Listing, MENU, Mode, Msg, View};
 use crate::{auth, format_ms};
 
@@ -21,14 +21,21 @@ use crate::{auth, format_ms};
 fn help(view: View) -> &'static str {
     match view {
         View::Menu => "right open  / search  space pause  n/p skip  D device  ? help  q quit",
-        View::Search | View::Liked => {
-            "left back  enter play  l like  A add  e queue  ? help  space pause  q quit"
+        View::Search => {
+            "left back  enter play/open  g artist  l like  A add  e queue  ? help  q quit"
+        }
+        View::Liked => "left back  enter play  g artist  l like  A add  e queue  ? help  q quit",
+        View::Artist => {
+            "left back  enter play/open  g artist  l like  A add  P album  e queue  q quit"
+        }
+        View::AlbumTracks => {
+            "left back  enter play  g artist  l like  A add  P play album  e queue  q quit"
         }
         View::Playlists => {
             "left back  right open  P play playlist  ? help  space pause  n/p skip  q quit"
         }
         View::PlaylistTracks => {
-            "left back  enter play  l like  A add  x remove  P play all  e queue  q quit"
+            "left back  enter play  g artist  l like  A add  x remove  P play all  q quit"
         }
     }
 }
@@ -188,6 +195,57 @@ fn empty<T>(listing: &Listing<T>, idle: &'static str) -> &'static str {
     }
 }
 
+fn album_items(albums: &[ArtistAlbum]) -> Vec<ListItem<'static>> {
+    albums
+        .iter()
+        .map(|a| {
+            let year = a.release_date.get(..4).unwrap_or("");
+            ListItem::new(Line::from(vec![
+                Span::raw(a.name.clone()),
+                dim(format!(
+                    "  {year}  {}  {} tracks",
+                    a.album_type, a.total_tracks
+                )),
+            ]))
+        })
+        .collect()
+}
+
+/// The artist page: best-matching songs above, albums and singles below.
+fn draw_artist(frame: &mut Frame, app: &mut App, area: Rect) {
+    let name = app.open_artist.as_ref().map_or("Artist", |a| &a.name);
+    let [songs_area, albums_area] =
+        Layout::vertical([Constraint::Length(12), Constraint::Min(3)]).areas(area);
+    let songs_title = format!(" {name}: top matches ");
+    let songs_empty = if app.artist_top_loading {
+        "Loading..."
+    } else {
+        "No songs found."
+    };
+    draw_list(
+        frame,
+        songs_area,
+        songs_title,
+        track_items(&app.artist_top, &app.liked_flags),
+        &mut app.artist_top_state,
+        songs_empty,
+    );
+    let albums_title = format!(
+        " Albums and singles ({}/{}) ",
+        app.artist_albums.items.len(),
+        app.artist_albums.total
+    );
+    let albums_empty = empty(&app.artist_albums, "No albums.");
+    draw_list(
+        frame,
+        albums_area,
+        albums_title,
+        album_items(&app.artist_albums.items),
+        &mut app.artist_albums.state,
+        albums_empty,
+    );
+}
+
 fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
     match app.view {
         View::Menu => {
@@ -201,14 +259,46 @@ fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
                 "",
             );
         }
-        View::Search => draw_list(
-            frame,
-            area,
-            " Results ".into(),
-            track_items(&app.results, &app.liked_flags),
-            &mut app.results_state,
-            "Press / to search for tracks.",
-        ),
+        View::Search => {
+            let mut items: Vec<ListItem<'static>> = app
+                .results_artists
+                .iter()
+                .map(|a| {
+                    ListItem::new(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(a.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                        Span::styled("  Artist", Style::new().fg(Color::Cyan)),
+                    ]))
+                })
+                .collect();
+            items.extend(track_items(&app.results, &app.liked_flags));
+            draw_list(
+                frame,
+                area,
+                " Results ".into(),
+                items,
+                &mut app.results_state,
+                "Press / to search for artists and tracks.",
+            );
+        }
+        View::Artist => draw_artist(frame, app, area),
+        View::AlbumTracks => {
+            let name = app.open_album.as_ref().map_or("Album", |a| &a.name);
+            let title = format!(
+                " {name} ({}/{}) ",
+                app.album_tracks.items.len(),
+                app.album_tracks.total
+            );
+            let none = empty(&app.album_tracks, "No tracks to show.");
+            draw_list(
+                frame,
+                area,
+                title,
+                track_items(&app.album_tracks.items, &app.liked_flags),
+                &mut app.album_tracks.state,
+                none,
+            );
+        }
         View::Liked => {
             let none = empty(&app.liked, "No liked songs.");
             draw_list(
@@ -395,13 +485,14 @@ fn draw_devices(frame: &mut Frame, app: &mut App) {
 }
 
 /// Every shortcut, as (keys, what it does). Keep in step with `App::browse_key`.
-const HELP_BROWSE: [(&str, &str); 12] = [
+const HELP_BROWSE: [(&str, &str); 13] = [
     ("w s / k j", "Move up / down"),
     ("d / right", "Open"),
     ("a / left", "Back"),
     ("/", "Search"),
-    ("enter", "Play track"),
-    ("P", "Play playlist"),
+    ("enter", "Play track / open artist"),
+    ("g", "Go to the track's artist"),
+    ("P", "Play playlist / album"),
     ("e", "Add to queue"),
     ("l", "Like / unlike"),
     ("L", "Like / unlike playing"),
@@ -485,8 +576,32 @@ impl Ctx {
 
     fn perform(&self, action: Action) {
         match action {
-            Action::Search(query) => self.spawn(|api| async move {
-                Msg::Results(api.search_tracks(&query, 0).await.map_err(err))
+            Action::Search(query) => self
+                .spawn(|api| async move { Msg::Results(api.search(&query, 0).await.map_err(err)) }),
+            Action::LoadArtist(artist) => {
+                let id = artist.id.clone();
+                let top_id = id.clone();
+                let albums_id = id.clone();
+                self.spawn(move |api| async move {
+                    let result = api.artist_tracks(&artist).await.map_err(err);
+                    Msg::ArtistTracks { id: top_id, result }
+                });
+                self.spawn(move |api| async move {
+                    let result = api.artist_albums(&albums_id, 0).await.map_err(err);
+                    Msg::ArtistAlbums {
+                        id: albums_id,
+                        offset: 0,
+                        result,
+                    }
+                });
+            }
+            Action::LoadArtistAlbums { id, offset } => self.spawn(move |api| async move {
+                let result = api.artist_albums(&id, offset).await.map_err(err);
+                Msg::ArtistAlbums { id, offset, result }
+            }),
+            Action::LoadAlbumTracks { id, offset } => self.spawn(move |api| async move {
+                let result = api.album_tracks(&id, offset).await.map_err(err);
+                Msg::AlbumTracks { id, offset, result }
             }),
             Action::Queue { uri, label } => self.spawn(|api| async move {
                 match api.queue(&uri).await {
@@ -688,7 +803,10 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::api::{Album, Artist, Count, Device, Item, Owner, Page, Playback, Playlist, Track};
+    use crate::api::{
+        Album, Artist, Count, Device, Item, Owner, Page, Playback, Playlist, SearchResults, Track,
+    };
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn render(app: &mut App, now: Instant) -> String {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -700,6 +818,13 @@ mod tests {
             .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn found_tracks(tracks: Vec<Track>) -> Msg {
+        Msg::Results(Ok(SearchResults {
+            artists: Vec::new(),
+            tracks,
+        }))
     }
 
     fn sample_device() -> Device {
@@ -720,6 +845,7 @@ mod tests {
             artists: artists
                 .iter()
                 .map(|a| Artist {
+                    id: format!("id-{a}"),
                     name: (*a).to_string(),
                 })
                 .collect(),
@@ -759,7 +885,7 @@ mod tests {
             track("Loved Song", &["A"], None),
             track("Plain Song", &["A"], None),
         ];
-        app.apply(Msg::Results(Ok(tracks)), t0);
+        app.apply(found_tracks(tracks), t0);
         app.apply(
             Msg::LikedFlags {
                 uris: vec![
@@ -782,10 +908,7 @@ mod tests {
         let mut app = App::new(t0);
         app.view = View::Search;
         app.apply(Msg::Me(Ok("me".into())), t0);
-        app.apply(
-            Msg::Results(Ok(vec![track("Wanted Song", &["A"], None)])),
-            t0,
-        );
+        app.apply(found_tracks(vec![track("Wanted Song", &["A"], None)]), t0);
         let playlists = vec![
             playlist("p1", "Road Trip", "me", Some(42)),
             playlist("p2", "Today's Hits", "spotify", None),
@@ -868,7 +991,10 @@ mod tests {
         app.view = View::Search;
         let screen = render(&mut app, now);
         assert!(screen.contains("Search (/)"), "{screen}");
-        assert!(screen.contains("Press / to search for tracks."), "{screen}");
+        assert!(
+            screen.contains("Press / to search for artists and tracks."),
+            "{screen}"
+        );
     }
 
     #[test]
@@ -897,6 +1023,8 @@ mod tests {
             View::Liked,
             View::Playlists,
             View::PlaylistTracks,
+            View::Artist,
+            View::AlbumTracks,
         ] {
             let len = help(view).chars().count();
             assert!(len <= 80, "{view:?} help is {len} columns");
@@ -1031,7 +1159,7 @@ mod tests {
         let mut app = App::new(t0);
         app.view = View::Search;
         let track = track("Get Lucky", &["Daft Punk"], Some("RAM"));
-        app.apply(Msg::Results(Ok(vec![track])), t0);
+        app.apply(found_tracks(vec![track]), t0);
         let playback = Playback {
             is_playing: true,
             shuffle_state: true,
@@ -1043,6 +1171,7 @@ mod tests {
                 name: "One More Time".into(),
                 duration_ms: 320_000,
                 artists: vec![Artist {
+                    id: "dp".into(),
                     name: "Daft Punk".into(),
                 }],
             }),
@@ -1080,5 +1209,78 @@ mod tests {
         let screen = render(&mut app, now);
         assert!(screen.contains("Devices"), "{screen}");
         assert!(screen.contains("spotifyd  (Computer)  40%"), "{screen}");
+    }
+
+    #[test]
+    fn search_lists_artists_above_tracks() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.view = View::Search;
+        app.apply(
+            Msg::Results(Ok(SearchResults {
+                artists: vec![Artist {
+                    id: "dp".into(),
+                    name: "Daft Punk".into(),
+                }],
+                tracks: vec![track("Get Lucky", &["Daft Punk"], Some("RAM"))],
+            })),
+            now,
+        );
+        let screen = render(&mut app, now);
+        let artist_row = screen.lines().position(|l| l.contains("Daft Punk  Artist"));
+        let track_row = screen.lines().position(|l| l.contains("Get Lucky"));
+        assert!(artist_row < track_row && artist_row.is_some(), "{screen}");
+    }
+
+    #[test]
+    fn artist_page_shows_top_matches_above_albums() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.apply(found_tracks(vec![]), now);
+        app.view = View::Search;
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.view, View::Search, "no tracks yet, so no artist");
+
+        let song = track("Get Lucky", &["Daft Punk"], Some("RAM"));
+        app.apply(found_tracks(vec![song.clone()]), now);
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.view, View::Artist);
+        let screen = render(&mut app, now);
+        assert!(screen.contains("Daft Punk: top matches"), "{screen}");
+        assert!(screen.contains("Loading..."), "{screen}");
+
+        app.apply(
+            Msg::ArtistTracks {
+                id: "id-Daft Punk".into(),
+                result: Ok(vec![song]),
+            },
+            now,
+        );
+        app.apply(
+            Msg::ArtistAlbums {
+                id: "id-Daft Punk".into(),
+                offset: 0,
+                result: Ok(Page {
+                    items: vec![ArtistAlbum {
+                        id: "al".into(),
+                        uri: "spotify:album:al".into(),
+                        name: "Discovery".into(),
+                        album_type: "album".into(),
+                        release_date: "2001-03-12".into(),
+                        total_tracks: 14,
+                    }],
+                    total: 1,
+                    fetched: 1,
+                }),
+            },
+            now,
+        );
+        let screen = render(&mut app, now);
+        let song_row = screen.lines().position(|l| l.contains("Get Lucky"));
+        let album_row = screen
+            .lines()
+            .position(|l| l.contains("Discovery") && l.contains("2001  album  14 tracks"));
+        assert!(song_row < album_row && song_row.is_some(), "{screen}");
+        assert!(screen.contains("Albums and singles (1/1)"), "{screen}");
     }
 }

@@ -26,8 +26,11 @@ struct Devices {
     devices: Vec<Device>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Artist {
+    /// Empty if Spotify omits it (not expected for catalogue artists).
+    #[serde(default)]
+    pub id: String,
     pub name: String,
 }
 
@@ -88,6 +91,28 @@ pub struct Playback {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Album {
     pub name: String,
+}
+
+/// An album, single or compilation as listed on an artist's page.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtistAlbum {
+    pub id: String,
+    pub uri: String,
+    pub name: String,
+    /// `album`, `single` or `compilation`.
+    #[serde(default)]
+    pub album_type: String,
+    /// `2013`, `2013-05` or `2013-05-17`, depending on the release's precision.
+    #[serde(default)]
+    pub release_date: String,
+    #[serde(default)]
+    pub total_tracks: u32,
+}
+
+/// Matches for one search: artists and tracks, each in Spotify's relevance order.
+pub struct SearchResults {
+    pub artists: Vec<Artist>,
+    pub tracks: Vec<Track>,
 }
 
 /// A track, or a podcast episode inside a playlist (which has no artists or album).
@@ -166,12 +191,13 @@ struct PlaylistEntry {
 
 #[derive(Deserialize)]
 struct SearchResponse {
-    tracks: SearchTracks,
+    tracks: Option<SearchItems<Track>>,
+    artists: Option<SearchItems<Artist>>,
 }
 
 #[derive(Deserialize)]
-struct SearchTracks {
-    items: Vec<Track>,
+struct SearchItems<T> {
+    items: Vec<T>,
 }
 
 /// Request body for `PUT /me/player/play`: single tracks and episodes are
@@ -348,16 +374,69 @@ impl Api {
         Ok(())
     }
 
-    /// Track search. Spotify caps `limit` at 10 for Development Mode apps.
-    pub async fn search_tracks(&self, query: &str, offset: u32) -> Result<Vec<Track>> {
+    /// Track and artist search. Spotify caps `limit` at 10 per type for Development Mode apps.
+    pub async fn search(&self, query: &str, offset: u32) -> Result<SearchResults> {
         let params = [
             ("q", query.to_string()),
-            ("type", "track".to_string()),
+            ("type", "track,artist".to_string()),
             ("limit", "10".to_string()),
             ("offset", offset.to_string()),
         ];
         let resp = self.send(Method::GET, "/search", &params, None).await?;
-        Ok(resp.json::<SearchResponse>().await?.tracks.items)
+        let body = resp.json::<SearchResponse>().await?;
+        Ok(SearchResults {
+            artists: body.artists.map(|a| a.items).unwrap_or_default(),
+            tracks: body.tracks.map(|t| t.items).unwrap_or_default(),
+        })
+    }
+
+    /// An artist's best matches by search, in Spotify's relevance order. Spotify removed
+    /// its top-tracks endpoint and the `popularity` field, so this is not a popularity ranking.
+    pub async fn artist_tracks(&self, artist: &Artist) -> Result<Vec<Track>> {
+        let name = artist.name.replace('"', "");
+        let params = [
+            ("q", format!("artist:\"{name}\"")),
+            ("type", "track".to_string()),
+            ("limit", "10".to_string()),
+        ];
+        let resp = self.send(Method::GET, "/search", &params, None).await?;
+        let body = resp.json::<SearchResponse>().await?;
+        // The filter also matches other artists with the same name; keep this one's tracks.
+        Ok(body
+            .tracks
+            .map(|t| t.items)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.artists.iter().any(|a| a.id == artist.id))
+            .collect())
+    }
+
+    /// Albums and singles by an artist, newest first as Spotify returns them.
+    pub async fn artist_albums(&self, id: &str, offset: u32) -> Result<Page<ArtistAlbum>> {
+        let params = [
+            ("include_groups", "album,single".to_string()),
+            ("limit", "10".to_string()),
+            ("offset", offset.to_string()),
+        ];
+        let resp = self
+            .send(Method::GET, &format!("/artists/{id}/albums"), &params, None)
+            .await?;
+        let page: Paged<ArtistAlbum> = resp.json().await?;
+        Ok(Page {
+            fetched: page.items.len() as u32,
+            total: page.total,
+            items: page.items,
+        })
+    }
+
+    /// Tracks of an album, in track order.
+    pub async fn album_tracks(&self, id: &str, offset: u32) -> Result<Page<Track>> {
+        let page: Paged<Track> = self.paged(&format!("/albums/{id}/tracks"), offset).await?;
+        Ok(Page {
+            fetched: page.items.len() as u32,
+            total: page.total,
+            items: page.items,
+        })
     }
 
     async fn paged<T: serde::de::DeserializeOwned>(
@@ -664,25 +743,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_sends_encoded_query_and_parses_tracks() {
+    async fn search_sends_encoded_query_and_parses_artists_and_tracks() {
         let body = r#"{"tracks":{"href":"x","total":1,"items":[
             {"uri":"spotify:track:abc","name":"Get Lucky","duration_ms":369000,
-             "artists":[{"name":"Daft Punk"}],"album":{"name":"RAM","id":"a1"},"is_local":false}]}}"#;
-        let (api, request) = serve_once(format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        ))
-        .await;
-        let tracks = api.search_tracks("daft punk & co", 10).await.unwrap();
+             "artists":[{"id":"ar1","name":"Daft Punk"}],"album":{"name":"RAM","id":"a1"},"is_local":false}]},
+            "artists":{"items":[{"id":"ar1","name":"Daft Punk","genres":["french house"]}]}}"#;
+        let (api, request) = serve_once(json_ok(body)).await;
+        let found = api.search("daft punk & co", 10).await.unwrap();
         let raw = request.await.unwrap();
         let line = raw.lines().next().unwrap();
         assert!(
-            line.starts_with("GET /search?q=daft+punk+%26+co&type=track&limit=10&offset=10 "),
+            line.starts_with(
+                "GET /search?q=daft+punk+%26+co&type=track%2Cartist&limit=10&offset=10 "
+            ),
+            "{line}"
+        );
+        assert_eq!(found.tracks.len(), 1);
+        assert_eq!(found.tracks[0].uri, "spotify:track:abc");
+        assert_eq!(found.tracks[0].album.as_ref().unwrap().name, "RAM");
+        assert_eq!(found.tracks[0].artists[0].id, "ar1");
+        assert_eq!(found.artists.len(), 1);
+        assert_eq!(found.artists[0].name, "Daft Punk");
+    }
+
+    #[tokio::test]
+    async fn artist_tracks_search_by_artist_and_drop_other_artists() {
+        let body = r#"{"tracks":{"items":[
+            {"uri":"spotify:track:mine","name":"Mine","duration_ms":1,"artists":[{"id":"ar1","name":"X"}]},
+            {"uri":"spotify:track:other","name":"Other","duration_ms":1,"artists":[{"id":"ar2","name":"X"}]}]}}"#;
+        let (api, request) = serve_once(json_ok(body)).await;
+        let artist = Artist {
+            id: "ar1".into(),
+            name: "X \"Q\"".into(),
+        };
+        let tracks = api.artist_tracks(&artist).await.unwrap();
+        let raw = request.await.unwrap();
+        let line = raw.lines().next().unwrap();
+        assert!(
+            line.starts_with("GET /search?q=artist%3A%22X+Q%22&type=track&limit=10 "),
             "{line}"
         );
         assert_eq!(tracks.len(), 1);
-        assert_eq!(tracks[0].uri, "spotify:track:abc");
-        assert_eq!(tracks[0].album.as_ref().unwrap().name, "RAM");
+        assert_eq!(tracks[0].uri, "spotify:track:mine");
+    }
+
+    #[tokio::test]
+    async fn artist_albums_ask_for_albums_and_singles_and_parse_the_page() {
+        let body = r#"{"total":12,"items":[
+            {"id":"al1","uri":"spotify:album:al1","name":"Discovery","album_type":"album",
+             "release_date":"2001-03-12","total_tracks":14,"images":[]}]}"#;
+        let (api, request) = serve_once(json_ok(body)).await;
+        let page = api.artist_albums("ar1", 10).await.unwrap();
+        let raw = request.await.unwrap();
+        let line = raw.lines().next().unwrap();
+        assert!(
+            line.starts_with(
+                "GET /artists/ar1/albums?include_groups=album%2Csingle&limit=10&offset=10 "
+            ),
+            "{line}"
+        );
+        assert_eq!((page.total, page.fetched), (12, 1));
+        assert_eq!(page.items[0].uri, "spotify:album:al1");
+        assert_eq!(page.items[0].total_tracks, 14);
+    }
+
+    #[tokio::test]
+    async fn album_tracks_parse_tracks_without_an_album_field() {
+        let body = r#"{"total":1,"items":[
+            {"uri":"spotify:track:t1","name":"One More Time","duration_ms":320000,
+             "artists":[{"id":"ar1","name":"Daft Punk"}],"track_number":1}]}"#;
+        let (api, request) = serve_once(json_ok(body)).await;
+        let page = api.album_tracks("al1", 0).await.unwrap();
+        let raw = request.await.unwrap();
+        assert!(
+            raw.starts_with("GET /albums/al1/tracks?limit=50&offset=0 "),
+            "{raw}"
+        );
+        assert_eq!(page.items[0].name, "One More Time");
+        assert!(page.items[0].album.is_none());
     }
 
     #[tokio::test]

@@ -7,7 +7,9 @@ use std::time::Instant;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 
-use crate::api::{Count, Device, Page, Playback, Playlist, Repeat, Track};
+use crate::api::{
+    Artist, ArtistAlbum, Count, Device, Page, Playback, Playlist, Repeat, SearchResults, Track,
+};
 
 const VOLUME_STEP: u8 = 5;
 /// Tracks sent in one `uris` play request when starting from Liked Songs.
@@ -58,6 +60,16 @@ pub enum Action {
         id: String,
         offset: u32,
     },
+    /// Fetch an artist's best-matching tracks and first page of albums.
+    LoadArtist(Artist),
+    LoadArtistAlbums {
+        id: String,
+        offset: u32,
+    },
+    LoadAlbumTracks {
+        id: String,
+        offset: u32,
+    },
     CheckLiked(Vec<String>),
     SetLiked {
         uri: String,
@@ -88,7 +100,21 @@ pub enum Msg {
     Key(KeyEvent),
     Me(Result<String, String>),
     Playback(Result<Option<Playback>, String>),
-    Results(Result<Vec<Track>, String>),
+    Results(Result<SearchResults, String>),
+    ArtistTracks {
+        id: String,
+        result: Result<Vec<Track>, String>,
+    },
+    ArtistAlbums {
+        id: String,
+        offset: u32,
+        result: Result<Page<ArtistAlbum>, String>,
+    },
+    AlbumTracks {
+        id: String,
+        offset: u32,
+        result: Result<Page<Track>, String>,
+    },
     Devices(Result<Vec<Device>, String>),
     Liked {
         offset: u32,
@@ -157,6 +183,16 @@ pub enum View {
     Liked,
     Playlists,
     PlaylistTracks,
+    /// An artist's best matches and albums.
+    Artist,
+    AlbumTracks,
+}
+
+/// Which list on the artist page the selection is in.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum ArtistFocus {
+    Songs,
+    Albums,
 }
 
 /// A list that Spotify serves in pages, loaded as the selection nears the end.
@@ -257,12 +293,22 @@ pub struct App {
     history: Vec<View>,
     pub menu_state: ListState,
     pub query: String,
+    /// Artists matching the search, listed above the tracks in the results.
+    pub results_artists: Vec<Artist>,
     pub results: Vec<Track>,
     pub results_state: ListState,
     pub liked: Listing<Track>,
     pub playlists: Listing<Playlist>,
     pub open_playlist: Option<Playlist>,
     pub playlist_tracks: Listing<Track>,
+    pub open_artist: Option<Artist>,
+    pub artist_top: Vec<Track>,
+    pub artist_top_state: ListState,
+    pub artist_top_loading: bool,
+    pub artist_albums: Listing<ArtistAlbum>,
+    pub artist_focus: ArtistFocus,
+    pub open_album: Option<ArtistAlbum>,
+    pub album_tracks: Listing<Track>,
     /// The user's Spotify id, used to tell which playlists can be written to.
     pub me_id: Option<String>,
     /// Whether each track seen so far is in Liked Songs. Absent means not checked yet.
@@ -305,12 +351,21 @@ impl App {
             history: Vec::new(),
             menu_state,
             query: String::new(),
+            results_artists: Vec::new(),
             results: Vec::new(),
             results_state: ListState::default(),
             liked: Listing::new(),
             playlists: Listing::new(),
             open_playlist: None,
             playlist_tracks: Listing::new(),
+            open_artist: None,
+            artist_top: Vec::new(),
+            artist_top_state: ListState::default(),
+            artist_top_loading: false,
+            artist_albums: Listing::new(),
+            artist_focus: ArtistFocus::Songs,
+            open_album: None,
+            album_tracks: Listing::new(),
             me_id: None,
             liked_flags: HashMap::new(),
             picker_track: None,
@@ -364,6 +419,8 @@ impl App {
         self.results
             .iter()
             .chain(&self.playlist_tracks.items)
+            .chain(&self.artist_top)
+            .chain(&self.album_tracks.items)
             .chain(&self.liked.items)
             .find(|t| t.uri == uri)
     }
@@ -427,17 +484,67 @@ impl App {
                     return Some(Action::CheckLiked(vec![uri]));
                 }
             }
-            Msg::Results(Ok(tracks)) => {
+            Msg::Results(Ok(found)) => {
+                let SearchResults { artists, tracks } = found;
+                let empty = artists.is_empty() && tracks.is_empty();
                 self.results_state
-                    .select(if tracks.is_empty() { None } else { Some(0) });
-                self.info(if tracks.is_empty() {
-                    "No tracks found.".to_string()
+                    .select(if empty { None } else { Some(0) });
+                self.info(if empty {
+                    "Nothing found.".to_string()
                 } else {
-                    format!("{} results", tracks.len())
+                    format!("{} artists, {} tracks", artists.len(), tracks.len())
                 });
                 let check = self.check_liked(&tracks);
+                self.results_artists = artists;
                 self.results = tracks;
                 return check;
+            }
+            Msg::ArtistTracks { id, result } => {
+                if !self.is_open_artist(&id) {
+                    return None;
+                }
+                self.artist_top_loading = false;
+                match result {
+                    Ok(tracks) => {
+                        let check = self.check_liked(&tracks);
+                        self.artist_top = tracks;
+                        self.settle_artist_focus();
+                        return check;
+                    }
+                    Err(e) => {
+                        self.settle_artist_focus();
+                        self.error(&e);
+                    }
+                }
+            }
+            Msg::ArtistAlbums { id, offset, result } => {
+                if !self.is_open_artist(&id) {
+                    return None;
+                }
+                match result {
+                    Ok(page) => self.artist_albums.apply(offset, page),
+                    Err(e) => {
+                        self.artist_albums.loading = false;
+                        self.error(&e);
+                    }
+                }
+                self.settle_artist_focus();
+            }
+            Msg::AlbumTracks { id, offset, result } => {
+                if self.open_album.as_ref().map(|a| a.id.as_str()) != Some(id.as_str()) {
+                    return None;
+                }
+                match result {
+                    Ok(page) => {
+                        let check = self.check_liked(&page.items);
+                        self.album_tracks.apply(offset, page);
+                        return check;
+                    }
+                    Err(e) => {
+                        self.album_tracks.loading = false;
+                        self.error(&e);
+                    }
+                }
             }
             Msg::Devices(Ok(devices)) => {
                 let active = devices.iter().position(|d| d.is_active);
@@ -606,10 +713,60 @@ impl App {
 
     fn selected_track(&self) -> Option<&Track> {
         match self.view {
-            View::Search => self.results.get(self.results_state.selected()?),
+            View::Search => {
+                let row = self.results_state.selected()?;
+                self.results
+                    .get(row.checked_sub(self.results_artists.len())?)
+            }
             View::Liked => self.liked.selected(),
             View::PlaylistTracks => self.playlist_tracks.selected(),
-            View::Menu | View::Playlists => None,
+            View::Artist if self.artist_focus == ArtistFocus::Songs => {
+                self.artist_top.get(self.artist_top_state.selected()?)
+            }
+            View::AlbumTracks => self.album_tracks.selected(),
+            View::Artist | View::Menu | View::Playlists => None,
+        }
+    }
+
+    /// The artist highlighted in the search results, if the selection is on an artist row.
+    fn selected_result_artist(&self) -> Option<&Artist> {
+        if self.view != View::Search {
+            return None;
+        }
+        self.results_artists.get(self.results_state.selected()?)
+    }
+
+    fn is_open_artist(&self, id: &str) -> bool {
+        self.open_artist.as_ref().map(|a| a.id.as_str()) == Some(id)
+    }
+
+    /// Keeps the artist page's selection in the list that has rows, and only there.
+    fn settle_artist_focus(&mut self) {
+        let no_songs = self.artist_top.is_empty() && !self.artist_top_loading;
+        let no_albums = self.artist_albums.items.is_empty() && !self.artist_albums.loading;
+        if self.artist_focus == ArtistFocus::Songs && no_songs && !no_albums {
+            self.artist_focus = ArtistFocus::Albums;
+        } else if self.artist_focus == ArtistFocus::Albums
+            && no_albums
+            && !self.artist_top.is_empty()
+        {
+            self.artist_focus = ArtistFocus::Songs;
+        }
+        match self.artist_focus {
+            ArtistFocus::Songs => {
+                self.artist_albums.state.select(None);
+                if self.artist_top_state.selected().is_none() && !self.artist_top.is_empty() {
+                    self.artist_top_state.select(Some(0));
+                }
+            }
+            ArtistFocus::Albums => {
+                self.artist_top_state.select(None);
+                if self.artist_albums.state.selected().is_none()
+                    && !self.artist_albums.items.is_empty()
+                {
+                    self.artist_albums.state.select(Some(0));
+                }
+            }
         }
     }
 
@@ -658,6 +815,56 @@ impl App {
         Some(Action::LoadPlaylistTracks { id, offset: 0 })
     }
 
+    /// Shows `artist`'s page and asks for its songs and first albums.
+    fn open_artist(&mut self, artist: Artist) -> Option<Action> {
+        if self.is_open_artist(&artist.id) {
+            // Already loaded: return to its page instead of stacking another copy.
+            if let Some(at) = self.history.iter().rposition(|v| *v == View::Artist) {
+                self.history.truncate(at);
+                self.view = View::Artist;
+            }
+            return None;
+        }
+        if artist.id.is_empty() {
+            self.error("Spotify gave no id for this artist.");
+            return None;
+        }
+        self.open_artist = Some(artist.clone());
+        self.artist_top = Vec::new();
+        self.artist_top_state = ListState::default();
+        self.artist_top_loading = true;
+        self.artist_albums = Listing::new();
+        self.artist_albums.loading = true;
+        self.artist_focus = ArtistFocus::Songs;
+        self.history.push(self.view);
+        self.view = View::Artist;
+        Some(Action::LoadArtist(artist))
+    }
+
+    fn open_selected_album(&mut self) -> Option<Action> {
+        let album = self.artist_albums.selected()?.clone();
+        let id = album.id.clone();
+        self.open_album = Some(album);
+        self.album_tracks = Listing::new();
+        self.album_tracks.loading = true;
+        self.history.push(self.view);
+        self.view = View::AlbumTracks;
+        Some(Action::LoadAlbumTracks { id, offset: 0 })
+    }
+
+    /// `g`: open the page of the first artist of the highlighted track.
+    fn go_to_artist(&mut self) -> Option<Action> {
+        let Some(track) = self.selected_track() else {
+            self.error("Highlight a track first.");
+            return None;
+        };
+        let Some(artist) = track.artists.first().cloned() else {
+            self.error("This item has no artist.");
+            return None;
+        };
+        self.open_artist(artist)
+    }
+
     fn back(&mut self) {
         if let Some(view) = self.history.pop() {
             self.view = view;
@@ -673,7 +880,12 @@ impl App {
                 _ => self.open(View::Playlists),
             },
             View::Playlists => self.open_selected_playlist(),
-            View::Search | View::Liked | View::PlaylistTracks => None,
+            View::Search => {
+                let artist = self.selected_result_artist()?.clone();
+                self.open_artist(artist)
+            }
+            View::Artist if self.artist_focus == ArtistFocus::Albums => self.open_selected_album(),
+            View::Artist | View::Liked | View::PlaylistTracks | View::AlbumTracks => None,
         }
     }
 
@@ -681,7 +893,30 @@ impl App {
     fn activate(&mut self) -> Option<Action> {
         match self.view {
             View::Menu | View::Playlists => self.open_selected(),
-            View::Search => self.selected_track().map(|t| Action::Play(t.uri.clone())),
+            View::Search => match self.selected_result_artist() {
+                Some(artist) => {
+                    let artist = artist.clone();
+                    self.open_artist(artist)
+                }
+                None => self.selected_track().map(|t| Action::Play(t.uri.clone())),
+            },
+            View::Artist => match self.artist_focus {
+                ArtistFocus::Albums => self.open_selected_album(),
+                ArtistFocus::Songs => {
+                    let start = self.artist_top_state.selected()?;
+                    let uris = self
+                        .artist_top
+                        .iter()
+                        .skip(start)
+                        .map(|t| t.uri.clone())
+                        .collect();
+                    Some(Action::PlayUris(uris))
+                }
+            },
+            View::AlbumTracks => Some(Action::PlayContext {
+                context_uri: self.open_album.as_ref()?.uri.clone(),
+                from: Some(self.album_tracks.selected()?.uri.clone()),
+            }),
             View::Liked => {
                 let start = self.liked.state.selected()?;
                 let uris = self
@@ -701,11 +936,15 @@ impl App {
         }
     }
 
-    /// `P`: play the whole highlighted or open playlist from its start.
+    /// `P`: play the whole highlighted or open playlist or album from its start.
     fn play_playlist(&self) -> Option<Action> {
         let uri = match self.view {
             View::Playlists => self.playlists.selected()?.uri.clone(),
             View::PlaylistTracks => self.open_playlist.as_ref()?.uri.clone(),
+            View::AlbumTracks => self.open_album.as_ref()?.uri.clone(),
+            View::Artist if self.artist_focus == ArtistFocus::Albums => {
+                self.artist_albums.selected()?.uri.clone()
+            }
             _ => return None,
         };
         Some(Action::PlayContext {
@@ -806,7 +1045,24 @@ impl App {
     fn move_selection(&mut self, delta: isize) -> Option<Action> {
         match self.view {
             View::Menu => step(&mut self.menu_state, MENU.len(), delta),
-            View::Search => step(&mut self.results_state, self.results.len(), delta),
+            View::Search => step(
+                &mut self.results_state,
+                self.results_artists.len() + self.results.len(),
+                delta,
+            ),
+            View::Artist => return self.move_in_artist(delta),
+            View::AlbumTracks => {
+                step(
+                    &mut self.album_tracks.state,
+                    self.album_tracks.items.len(),
+                    delta,
+                );
+                let id = self.open_album.as_ref()?.id.clone();
+                return self
+                    .album_tracks
+                    .want_more()
+                    .map(|offset| Action::LoadAlbumTracks { id, offset });
+            }
             View::Liked => {
                 step(&mut self.liked.state, self.liked.items.len(), delta);
                 return self
@@ -837,6 +1093,42 @@ impl App {
         None
     }
 
+    /// Moves within the artist page, crossing between songs and albums at the boundary.
+    fn move_in_artist(&mut self, delta: isize) -> Option<Action> {
+        match self.artist_focus {
+            ArtistFocus::Songs => {
+                let last = self.artist_top.len().saturating_sub(1);
+                let at_end = self.artist_top_state.selected().is_none_or(|i| i >= last);
+                if delta > 0 && at_end && !self.artist_albums.items.is_empty() {
+                    self.artist_focus = ArtistFocus::Albums;
+                    self.settle_artist_focus();
+                } else {
+                    step(&mut self.artist_top_state, self.artist_top.len(), delta);
+                }
+                None
+            }
+            ArtistFocus::Albums => {
+                let at_start = self.artist_albums.state.selected().is_none_or(|i| i == 0);
+                if delta < 0 && at_start && !self.artist_top.is_empty() {
+                    self.artist_focus = ArtistFocus::Songs;
+                    self.artist_top_state
+                        .select(Some(self.artist_top.len() - 1));
+                    self.settle_artist_focus();
+                    return None;
+                }
+                step(
+                    &mut self.artist_albums.state,
+                    self.artist_albums.items.len(),
+                    delta,
+                );
+                let id = self.open_artist.as_ref()?.id.clone();
+                self.artist_albums
+                    .want_more()
+                    .map(|offset| Action::LoadArtistAlbums { id, offset })
+            }
+        }
+    }
+
     fn browse_key(&mut self, code: KeyCode) -> Option<Action> {
         // Only an immediately following `x` confirms a removal; any other key cancels it.
         let confirming = self.pending_remove.take();
@@ -862,6 +1154,7 @@ impl App {
                     label: t.name.clone(),
                 });
             }
+            KeyCode::Char('g') => return self.go_to_artist(),
             KeyCode::Char('l') => return self.toggle_like(),
             KeyCode::Char('L') => return self.toggle_like_playing(),
             KeyCode::Char('A') => return self.open_picker(),
@@ -1034,9 +1327,68 @@ mod tests {
             uri: format!("spotify:track:{name}"),
             name: name.into(),
             duration_ms: 200_000,
-            artists: vec![Artist { name: "A".into() }],
+            artists: vec![Artist {
+                id: "ar-a".into(),
+                name: "A".into(),
+            }],
             album: Some(Album { name: "Alb".into() }),
         }
+    }
+
+    fn found_tracks(tracks: Vec<Track>) -> Msg {
+        Msg::Results(Ok(SearchResults {
+            artists: Vec::new(),
+            tracks,
+        }))
+    }
+
+    fn artist(id: &str) -> Artist {
+        Artist {
+            id: id.into(),
+            name: format!("Artist {id}"),
+        }
+    }
+
+    fn album(id: &str) -> ArtistAlbum {
+        ArtistAlbum {
+            id: id.into(),
+            uri: format!("spotify:album:{id}"),
+            name: format!("Album {id}"),
+            album_type: "album".into(),
+            release_date: "2001-03-12".into(),
+            total_tracks: 3,
+        }
+    }
+
+    /// A track by `artist_id`, as the artist page lists them.
+    fn track_by(name: &str, artist_id: &str) -> Track {
+        Track {
+            artists: vec![artist(artist_id)],
+            ..track(name)
+        }
+    }
+
+    /// Opens the page of artist "ar" with `songs` and `albums` already loaded.
+    fn artist_page(songs: Vec<Track>, albums: Vec<ArtistAlbum>, now: Instant) -> App {
+        let mut app = App::new(now);
+        app.open_artist(artist("ar"));
+        app.apply(
+            Msg::ArtistTracks {
+                id: "ar".into(),
+                result: Ok(songs),
+            },
+            now,
+        );
+        let total = albums.len() as u32;
+        app.apply(
+            Msg::ArtistAlbums {
+                id: "ar".into(),
+                offset: 0,
+                result: Ok(page(albums, total)),
+            },
+            now,
+        );
+        app
     }
 
     fn tracks(n: usize) -> Vec<Track> {
@@ -1109,7 +1461,7 @@ mod tests {
         let mut app = App::new(now);
         app.on_key(key(KeyCode::Char('/')));
         app.on_key(key(KeyCode::Esc));
-        app.apply(Msg::Results(Ok(vec![track("one"), track("two")])), now);
+        app.apply(found_tracks(vec![track("one"), track("two")]), now);
         app
     }
 
@@ -1816,7 +2168,7 @@ mod tests {
     fn local_files_cannot_be_liked_or_added() {
         let now = Instant::now();
         let mut app = app_with_results();
-        app.apply(Msg::Results(Ok(vec![local_track()])), now);
+        app.apply(found_tracks(vec![local_track()]), now);
         assert_eq!(app.on_key(key(KeyCode::Char('l'))), None);
         assert!(app.status_is_error, "{}", app.status);
         app.apply(Msg::Me(Ok("me".into())), now);
@@ -1830,7 +2182,7 @@ mod tests {
         let mut app = App::new(now);
         let results = vec![track("one"), local_track(), track("two")];
         assert_eq!(
-            app.apply(Msg::Results(Ok(results)), now),
+            app.apply(found_tracks(results), now),
             Some(Action::CheckLiked(vec![
                 "spotify:track:one".into(),
                 "spotify:track:two".into()
@@ -1844,7 +2196,7 @@ mod tests {
             now,
         );
         let again = vec![track("one"), track("two")];
-        assert_eq!(app.apply(Msg::Results(Ok(again)), now), None);
+        assert_eq!(app.apply(found_tracks(again), now), None);
         assert!(app.liked_flags["spotify:track:one"]);
         assert!(!app.liked_flags["spotify:track:two"]);
     }
@@ -1901,7 +2253,7 @@ mod tests {
     fn a_track_liked_now_appears_once_at_the_top_of_a_loaded_liked_list() {
         let now = Instant::now();
         let mut app = app_in_liked(3, 3);
-        app.apply(Msg::Results(Ok(vec![track("new")])), now);
+        app.apply(found_tracks(vec![track("new")]), now);
         let liked = |app: &mut App| {
             app.apply(
                 Msg::LikeChanged {
@@ -2049,7 +2401,7 @@ mod tests {
     fn add_needs_the_profile_to_have_loaded() {
         let now = Instant::now();
         let mut app = app_with_results();
-        app.apply(Msg::Results(Ok(vec![track("one")])), now);
+        app.apply(found_tracks(vec![track("one")]), now);
         assert_eq!(app.on_key(key(KeyCode::Char('A'))), None);
         assert_eq!(app.mode, Mode::Browse);
         assert!(app.status_is_error);
@@ -2319,5 +2671,221 @@ mod tests {
             now,
         );
         assert_eq!(app.playlist_tracks.items.len(), 3);
+    }
+
+    #[test]
+    fn search_lists_artists_above_tracks_and_enter_opens_an_artist() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.apply(
+            Msg::Results(Ok(SearchResults {
+                artists: vec![artist("ar")],
+                tracks: vec![track("one")],
+            })),
+            now,
+        );
+        app.view = View::Search;
+        assert_eq!(app.results_state.selected(), Some(0));
+        assert!(app.selected_track().is_none());
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::LoadArtist(artist("ar")))
+        );
+        assert_eq!(app.view, View::Artist);
+
+        app.back();
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.selected_track().unwrap().name, "one");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::Play("spotify:track:one".into()))
+        );
+    }
+
+    #[test]
+    fn g_opens_the_first_artist_of_the_highlighted_track() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.apply(found_tracks(vec![track_by("one", "ar")]), now);
+        app.view = View::Search;
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('g'))),
+            Some(Action::LoadArtist(artist("ar")))
+        );
+        assert_eq!(app.view, View::Artist);
+        assert!(app.artist_top_loading && app.artist_albums.loading);
+        // Already on that artist's page: nothing more to load.
+        assert_eq!(app.go_to_artist(), None);
+    }
+
+    #[test]
+    fn g_without_a_track_or_an_artist_id_says_so() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        assert_eq!(app.on_key(key(KeyCode::Char('g'))), None);
+        assert!(app.status_is_error);
+
+        let mut local = track("local");
+        local.artists = vec![Artist {
+            id: String::new(),
+            name: "Someone".into(),
+        }];
+        app.apply(found_tracks(vec![local]), now);
+        app.view = View::Search;
+        assert_eq!(app.on_key(key(KeyCode::Char('g'))), None);
+        assert_eq!(app.view, View::Search);
+        assert!(app.status.contains("no id"));
+    }
+
+    #[test]
+    fn artist_selection_crosses_from_songs_to_albums_and_back() {
+        let now = Instant::now();
+        let mut app = artist_page(
+            vec![track_by("s0", "ar"), track_by("s1", "ar")],
+            vec![album("a0"), album("a1")],
+            now,
+        );
+        assert_eq!(app.artist_focus, ArtistFocus::Songs);
+        assert_eq!(app.artist_top_state.selected(), Some(0));
+        assert_eq!(app.artist_albums.state.selected(), None);
+
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.artist_top_state.selected(), Some(1));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.artist_focus, ArtistFocus::Albums);
+        assert_eq!(app.artist_top_state.selected(), None);
+        assert_eq!(app.artist_albums.state.selected(), Some(0));
+
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.artist_focus, ArtistFocus::Songs);
+        assert_eq!(app.artist_top_state.selected(), Some(1));
+        assert_eq!(app.artist_albums.state.selected(), None);
+    }
+
+    #[test]
+    fn artist_with_no_song_matches_starts_on_the_albums() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.open_artist(artist("ar"));
+        app.apply(
+            Msg::ArtistAlbums {
+                id: "ar".into(),
+                offset: 0,
+                result: Ok(page(vec![album("a0")], 1)),
+            },
+            now,
+        );
+        // Songs are still loading, so the selection stays put until they arrive.
+        assert_eq!(app.artist_focus, ArtistFocus::Songs);
+        app.apply(
+            Msg::ArtistTracks {
+                id: "ar".into(),
+                result: Ok(Vec::new()),
+            },
+            now,
+        );
+        assert_eq!(app.artist_focus, ArtistFocus::Albums);
+        assert_eq!(app.artist_albums.state.selected(), Some(0));
+    }
+
+    #[test]
+    fn artist_results_for_another_artist_are_ignored() {
+        let now = Instant::now();
+        let mut app = App::new(now);
+        app.open_artist(artist("new"));
+        app.apply(
+            Msg::ArtistTracks {
+                id: "old".into(),
+                result: Ok(vec![track_by("stale", "old")]),
+            },
+            now,
+        );
+        app.apply(
+            Msg::ArtistAlbums {
+                id: "old".into(),
+                offset: 0,
+                result: Ok(page(vec![album("stale")], 1)),
+            },
+            now,
+        );
+        assert!(app.artist_top.is_empty() && app.artist_albums.items.is_empty());
+        assert!(app.artist_top_loading && app.artist_albums.loading);
+    }
+
+    #[test]
+    fn enter_on_songs_plays_from_the_selected_one_and_on_an_album_opens_it() {
+        let now = Instant::now();
+        let mut app = artist_page(
+            vec![track_by("s0", "ar"), track_by("s1", "ar")],
+            vec![album("a0")],
+            now,
+        );
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::PlayUris(vec!["spotify:track:s1".into()]))
+        );
+
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('P'))),
+            Some(Action::PlayContext {
+                context_uri: "spotify:album:a0".into(),
+                from: None
+            })
+        );
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::LoadAlbumTracks {
+                id: "a0".into(),
+                offset: 0
+            })
+        );
+        assert_eq!(app.view, View::AlbumTracks);
+    }
+
+    #[test]
+    fn album_tracks_play_within_the_album_and_back_returns_to_the_artist() {
+        let now = Instant::now();
+        let mut app = artist_page(Vec::new(), vec![album("a0")], now);
+        app.on_key(key(KeyCode::Enter));
+        app.apply(
+            Msg::AlbumTracks {
+                id: "a0".into(),
+                offset: 0,
+                result: Ok(page(vec![track_by("t0", "ar"), track_by("t1", "ar")], 2)),
+            },
+            now,
+        );
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::PlayContext {
+                context_uri: "spotify:album:a0".into(),
+                from: Some("spotify:track:t1".into())
+            })
+        );
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.view, View::Artist);
+
+        // `g` on an album's track goes back to the artist page it came from, without reloading.
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.view, View::AlbumTracks);
+        app.apply(
+            Msg::AlbumTracks {
+                id: "a0".into(),
+                offset: 0,
+                result: Ok(page(vec![track_by("t0", "ar")], 1)),
+            },
+            now,
+        );
+        assert_eq!(app.on_key(key(KeyCode::Char('g'))), None);
+        assert_eq!(app.view, View::Artist);
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(
+            app.view,
+            View::Menu,
+            "the artist page is not on the stack twice"
+        );
     }
 }
