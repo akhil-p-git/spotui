@@ -17,25 +17,38 @@ done
 lipo -create -output "$app/Contents/Resources/bin/spotui" \
   target/aarch64-apple-darwin/release/spotui target/x86_64-apple-darwin/release/spotui
 
-base="https://github.com/Spotifyd/spotifyd/releases/download/$SPOTIFYD_VERSION"
-for arch in aarch64 x86_64; do
-  name="spotifyd-macos-$arch-default"
-  mkdir -p "$work/$arch"
+# Spotify's prebuilt macOS spotifyd binaries link Homebrew's libportaudio (and libdbus),
+# which a stock Mac lacks. Build it from source with only the pure-Rust rodio backend.
+git clone --depth 1 --branch "$SPOTIFYD_VERSION" https://github.com/Spotifyd/spotifyd "$work/spotifyd-src"
+for target in aarch64-apple-darwin x86_64-apple-darwin; do
   (
-    cd "$work/$arch"
-    curl -fsSL -O "$base/$name.tar.gz" -O "$base/$name.sha512"
-    shasum -a 512 -c "$name.sha512"
-    tar xzf "$name.tar.gz"
+    cd "$work/spotifyd-src"
+    cargo build --release --locked --target "$target" \
+      --no-default-features --features rodio_backend
   )
 done
 lipo -create -output "$app/Contents/Resources/bin/spotifyd" \
-  "$work/aarch64/spotifyd" "$work/x86_64/spotifyd"
+  "$work/spotifyd-src/target/aarch64-apple-darwin/release/spotifyd" \
+  "$work/spotifyd-src/target/x86_64-apple-darwin/release/spotifyd"
 
 install -m 755 packaging/macos/Spotui "$app/Contents/MacOS/Spotui"
 install -m 755 packaging/macos/run.sh "$app/Contents/Resources/run.sh"
 install -m 644 packaging/macos/Spotui.icns "$app/Contents/Resources/Spotui.icns"
 sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
 chmod 755 "$app/Contents/Resources/bin/"*
+
+# The bundle must run on a Mac with nothing installed: fail on any non-system library.
+for bin in "$app/Contents/Resources/bin/"*; do
+  for arch in arm64 x86_64; do
+    extra="$(otool -arch "$arch" -L "$bin" | tail -n +2 | awk '{print $1}' \
+      | grep -Ev '^(/System/Library/|/usr/lib/)' || true)"
+    if [ -n "$extra" ]; then
+      echo "error: $bin ($arch) needs libraries a stock Mac lacks:" >&2
+      echo "$extra" >&2
+      exit 1
+    fi
+  done
+done
 
 codesign --force --sign - "$app/Contents/Resources/bin/spotui"
 codesign --force --sign - "$app/Contents/Resources/bin/spotifyd"

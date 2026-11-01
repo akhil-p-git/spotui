@@ -41,6 +41,7 @@ cat > "$sd_conf" <<CONF
 [global]
 device_name = "spotui"
 device_type = "computer"
+backend = "rodio"
 bitrate = 320
 cache_path = "$cache"
 CONF
