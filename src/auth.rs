@@ -191,9 +191,12 @@ pub async fn login(config: &Config) -> Result<()> {
         })?;
 
     println!("Open this URL in your browser to log in:\n\n{url}\n");
-    let _ = std::process::Command::new("xdg-open")
-        .arg(url.as_str())
-        .spawn();
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener).arg(url.as_str()).spawn();
 
     let code = loop {
         let (mut socket, _) = listener.accept().await?;

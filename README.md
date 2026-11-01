@@ -41,6 +41,19 @@ ln -s "$PWD/target/release/spotui" ~/.local/bin/spotui   # optional; ~/.local/bi
 
 The binary is `target/release/spotui`. With the symlink, a later `cargo build --release` updates the `spotui` command too.
 
+## macOS app
+
+Each [release](https://github.com/akhil-p-git/spotui/releases) with a `.dmg` carries a Mac build that bundles `spotui` and `spotifyd`, both for Apple Silicon and Intel. It needs macOS 11 or later.
+
+1. Open the `.dmg` and drag `Spotui` to Applications.
+2. The app is not signed with an Apple Developer ID, so macOS blocks it the first time. Run `xattr -dr com.apple.quarantine /Applications/Spotui.app` in Terminal once, or open System Settings > Privacy & Security and choose **Open Anyway** after the first blocked launch.
+3. Open Spotui. It opens a Terminal window and walks through the one-time setup: paste the Client ID of your own Spotify app (the steps are printed; they match "Set up" below), then approve two browser logins, one for spotui and one for the player.
+4. Press `D` in spotui and choose the `spotui` device.
+
+Every later launch skips the setup. Quitting spotui with `q` also stops the bundled player. The player's log is `~/Library/Logs/spotui-spotifyd.log`, the config is in `~/.config/spotui/`, and the player's login is cached in `~/Library/Caches/spotui/`.
+
+The Mac build is made by GitHub Actions (`.github/workflows/macos-dmg.yml`, script in `packaging/macos/`) and has not been run on a Mac by its author. If something fails, please open an issue with the Terminal output.
+
 ## Set up
 
 ### 1. Create a Spotify app

@@ -1,0 +1,38 @@
+name: macOS dmg
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to publish the dmg under as a pre-release (e.g. mac-v0.1.0). Leave empty to only build."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  dmg:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the dmg
+        run: packaging/macos/build-dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Spotui-dmg
+          path: dist/*.dmg
+          if-no-files-found: error
+      - name: Publish as a pre-release
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release create "$TAG" dist/*.dmg \
+            --prerelease \
+            --title "Spotui for macOS ($TAG)" \
+            --notes "Unsigned macOS build, untested on real hardware when published. See the README section 'macOS app' for the first-run steps." \
+            --target "$GITHUB_SHA"

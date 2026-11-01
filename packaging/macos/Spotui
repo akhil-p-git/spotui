@@ -1,0 +1,11 @@
+#!/bin/bash
+# App entry point: opens Terminal and runs run.sh there, because spotui is a terminal UI.
+res="$(cd "$(dirname "$0")/../Resources" && pwd)"
+exec /usr/bin/osascript - "$res/run.sh" <<'APPLESCRIPT'
+on run argv
+  tell application "Terminal"
+    activate
+    do script "exec " & quoted form of (item 1 of argv)
+  end tell
+end run
+APPLESCRIPT
