@@ -2,6 +2,9 @@ use anyhow::{Result, bail};
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const API_BASE: &str = "https://api.spotify.com/v1";
 
@@ -214,6 +217,23 @@ pub struct Api {
     http: reqwest::Client,
     token: String,
     base: String,
+    /// Unix second until which Spotify has told us to stop calling (429 Retry-After).
+    /// Shared across `Api` values so one 429 pauses the polling loop too.
+    blocked_until: Arc<AtomicU64>,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn human_wait(secs: u64) -> String {
+    match secs {
+        0..=89 => format!("{secs}s"),
+        90..=5399 => format!("{} min", secs.div_ceil(60)),
+        _ => format!("{:.1} h", secs as f64 / 3600.0),
+    }
 }
 
 impl Api {
@@ -227,7 +247,14 @@ impl Api {
             http,
             token,
             base: API_BASE.to_string(),
+            blocked_until: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Shares one rate-limit cooldown between several `Api` values.
+    pub fn with_cooldown(mut self, blocked_until: Arc<AtomicU64>) -> Self {
+        self.blocked_until = blocked_until;
+        self
     }
 
     #[cfg(test)]
@@ -236,6 +263,7 @@ impl Api {
             http: reqwest::Client::new(),
             token,
             base,
+            blocked_until: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -246,6 +274,16 @@ impl Api {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<reqwest::Response> {
+        let wait = self
+            .blocked_until
+            .load(Ordering::Relaxed)
+            .saturating_sub(now_secs());
+        if wait > 0 {
+            bail!(
+                "Spotify rate limit: no requests for another {}.",
+                human_wait(wait)
+            );
+        }
         let mut req = self
             .http
             .request(method.clone(), format!("{}{path}", self.base))
@@ -261,6 +299,20 @@ impl Api {
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let secs = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30);
+            self.blocked_until
+                .store(now_secs() + secs, Ordering::Relaxed);
+            bail!(
+                "Spotify rate limit hit: paused for {} ({method} {path} returned 429)",
+                human_wait(secs)
+            );
         }
         let text = resp.text().await.unwrap_or_default();
         // The fix goes first: the TUI shows one line and cuts off the long response body.
@@ -621,6 +673,23 @@ mod tests {
     }
 
     const NO_CONTENT: &str = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+
+    #[tokio::test]
+    async fn rate_limit_pauses_later_requests_without_calling_spotify() {
+        let (api, request) = serve_once(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3600\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let first = api.devices().await.unwrap_err().to_string();
+        request.await.unwrap();
+        assert!(
+            first.contains("rate limit hit: paused for 60 min"),
+            "{first}"
+        );
+        // The mock server is gone; a real request would fail with a connection error.
+        let second = api.devices().await.unwrap_err().to_string();
+        assert!(second.contains("no requests for another"), "{second}");
+    }
 
     #[test]
     fn devices_parse_from_api_shape() {

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -552,6 +553,8 @@ struct Ctx {
     config: Arc<auth::Config>,
     http: reqwest::Client,
     tx: UnboundedSender<Msg>,
+    /// Set by a 429 so every request, including the poll loop, waits it out.
+    blocked_until: Arc<AtomicU64>,
 }
 
 impl Ctx {
@@ -563,7 +566,13 @@ impl Ctx {
         let ctx = self.clone();
         tokio::spawn(async move {
             let msg = match auth::access_token(&ctx.config).await {
-                Ok(token) => task(Api::with_client(ctx.http.clone(), token)).await,
+                Ok(token) => {
+                    task(
+                        Api::with_client(ctx.http.clone(), token)
+                            .with_cooldown(ctx.blocked_until.clone()),
+                    )
+                    .await
+                }
                 Err(e) => Msg::Error(err(e)),
             };
             let _ = ctx.tx.send(msg);
@@ -757,6 +766,7 @@ async fn event_loop(terminal: &mut DefaultTerminal, config: auth::Config) -> Res
         config: Arc::new(config),
         http: reqwest::Client::new(),
         tx,
+        blocked_until: Arc::new(AtomicU64::new(0)),
     };
     let mut app = App::new(Instant::now());
     let mut tick = tokio::time::interval(Duration::from_secs(1));

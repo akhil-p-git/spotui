@@ -101,7 +101,7 @@ mkdir -p ~/.config/spotifyd
 ```ini
 [global]
 backend = "pulseaudio"
-device_name = "spotui"
+device_name = "spotui-linux"
 device_type = "computer"
 bitrate = 320
 ```
@@ -114,7 +114,7 @@ bitrate = 320
 spotifyd authenticate
 systemctl --user enable --now spotifyd
 systemctl --user is-active spotifyd       # prints "active"
-spotui devices                            # should list "spotui"
+spotui devices                            # should list "spotui-linux"
 ```
 
 Finally play a first song:
