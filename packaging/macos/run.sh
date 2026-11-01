@@ -50,7 +50,8 @@ sd_args=(--config-path "$sd_conf" --cache-path "$cache")
 
 if [ ! -f "$cache/oauth/credentials.json" ]; then
   echo "Logging the player (spotifyd) in to Spotify. Approve it in your browser."
-  spotifyd "${sd_args[@]}" authenticate || pause_and_exit
+  # The options must come after the subcommand: spotifyd rejects them before it.
+  spotifyd authenticate "${sd_args[@]}" || pause_and_exit
 fi
 
 if pgrep -x spotifyd > /dev/null; then
