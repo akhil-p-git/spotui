@@ -40,7 +40,8 @@ fn help(view: View) -> &'static str {
         }
     }
 }
-const POLL_EVERY_TICKS: u32 = 5;
+/// Seconds between playback polls. Two machines share one Client ID and one Spotify quota.
+const POLL_EVERY_TICKS: u32 = 15;
 /// Spotify reports the old state if asked immediately after a command.
 const SETTLE_DELAY: Duration = Duration::from_millis(400);
 
