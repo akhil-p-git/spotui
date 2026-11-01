@@ -5,6 +5,7 @@
   <key>CFBundleName</key><string>Spotui</string>
   <key>CFBundleDisplayName</key><string>Spotui</string>
   <key>CFBundleIdentifier</key><string>io.github.akhil-p-git.spotui</string>
+  <key>CFBundleIconFile</key><string>Spotui</string>
   <key>CFBundleExecutable</key><string>Spotui</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>@VERSION@</string>

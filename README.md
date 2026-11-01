@@ -52,7 +52,7 @@ Each [release](https://github.com/akhil-p-git/spotui/releases) with a `.dmg` car
 
 Every later launch skips the setup. Quitting spotui with `q` also stops the bundled player. The player's log is `~/Library/Logs/spotui-spotifyd.log`, the config is in `~/.config/spotui/`, and the player's login is cached in `~/Library/Caches/spotui/`.
 
-The Mac build is made by GitHub Actions (`.github/workflows/macos-dmg.yml`, script in `packaging/macos/`) and has not been run on a Mac by its author. If something fails, please open an issue with the Terminal output.
+The icon is `packaging/macos/icon.svg`; `make-icon.py` in the same folder turns it into `Spotui.icns`. The Mac build is made by GitHub Actions (`.github/workflows/macos-dmg.yml`, script in `packaging/macos/`) and has not been run on a Mac by its author. If something fails, please open an issue with the Terminal output.
 
 ## Set up
 

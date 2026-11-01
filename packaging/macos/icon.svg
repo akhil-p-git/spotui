@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#242424"/>
+      <stop offset="1" stop-color="#0d0d0d"/>
+    </linearGradient>
+    <clipPath id="win"><rect x="100" y="100" width="824" height="824" rx="185"/></clipPath>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <g clip-path="url(#win)">
+    <rect x="100" y="100" width="824" height="130" fill="#000" opacity="0.35"/>
+  </g>
+  <circle cx="205" cy="165" r="23" fill="#ff5f57"/>
+  <circle cx="268" cy="165" r="23" fill="#febc2e"/>
+  <circle cx="331" cy="165" r="23" fill="#28c840"/>
+  <g fill="none" stroke="#1ed760" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="270,470 420,577 270,684" stroke-width="72"/>
+    <path d="M661.1 504.2 A95 95 0 0 1 661.1 649.8" stroke-width="58"/>
+    <path d="M712.5 442.9 A175 175 0 0 1 712.5 711.1" stroke-width="58"/>
+    <path d="M763.9 381.7 A255 255 0 0 1 763.9 772.3" stroke-width="58"/>
+  </g>
+  <rect x="460" y="700" width="150" height="46" rx="12" fill="#1ed760"/>
+</svg>

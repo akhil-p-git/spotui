@@ -33,6 +33,7 @@ lipo -create -output "$app/Contents/Resources/bin/spotifyd" \
 
 install -m 755 packaging/macos/Spotui "$app/Contents/MacOS/Spotui"
 install -m 755 packaging/macos/run.sh "$app/Contents/Resources/run.sh"
+install -m 644 packaging/macos/Spotui.icns "$app/Contents/Resources/Spotui.icns"
 sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
 chmod 755 "$app/Contents/Resources/bin/"*
 
