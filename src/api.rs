@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -220,6 +221,9 @@ pub struct Api {
     /// Unix second until which Spotify has told us to stop calling (429 Retry-After).
     /// Shared across `Api` values so one 429 pauses the polling loop too.
     blocked_until: Arc<AtomicU64>,
+    /// Holds the same deadline on disk so a restart, the CLI, or a second spotui on
+    /// this machine honors a 429 it did not receive itself.
+    cooldown_file: Option<PathBuf>,
 }
 
 fn now_secs() -> u64 {
@@ -248,6 +252,9 @@ impl Api {
             token,
             base: API_BASE.to_string(),
             blocked_until: Arc::new(AtomicU64::new(0)),
+            cooldown_file: crate::auth::config_dir()
+                .ok()
+                .map(|dir| dir.join("rate-limit")),
         }
     }
 
@@ -264,7 +271,39 @@ impl Api {
             token,
             base,
             blocked_until: Arc::new(AtomicU64::new(0)),
+            cooldown_file: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_cooldown_file(mut self, file: PathBuf) -> Self {
+        self.cooldown_file = Some(file);
+        self
+    }
+
+    /// Unix second until which requests are paused: the later of this process's
+    /// deadline and the one on disk. A missing or unreadable file means no pause.
+    fn paused_until(&self) -> u64 {
+        let on_disk = self
+            .cooldown_file
+            .as_ref()
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        self.blocked_until.load(Ordering::Relaxed).max(on_disk)
+    }
+
+    /// Records a 429 in memory and on disk. Never shortens a longer pause already saved.
+    fn pause_until(&self, deadline: u64) -> std::io::Result<()> {
+        self.blocked_until.fetch_max(deadline, Ordering::Relaxed);
+        let Some(file) = &self.cooldown_file else {
+            return Ok(());
+        };
+        let deadline = deadline.max(self.paused_until());
+        // Write then rename so another spotui never reads half a number.
+        let scratch = file.with_extension("tmp");
+        std::fs::write(&scratch, deadline.to_string())?;
+        std::fs::rename(&scratch, file)
     }
 
     async fn send(
@@ -274,10 +313,7 @@ impl Api {
         query: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<reqwest::Response> {
-        let wait = self
-            .blocked_until
-            .load(Ordering::Relaxed)
-            .saturating_sub(now_secs());
+        let wait = self.paused_until().saturating_sub(now_secs());
         if wait > 0 {
             bail!(
                 "Spotify rate limit: no requests for another {}.",
@@ -307,10 +343,12 @@ impl Api {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(30);
-            self.blocked_until
-                .store(now_secs() + secs, Ordering::Relaxed);
+            let unsaved = match self.pause_until(now_secs() + secs) {
+                Ok(()) => String::new(),
+                Err(e) => format!("; could not save the pause to disk: {e}"),
+            };
             bail!(
-                "Spotify rate limit hit: paused for {} ({method} {path} returned 429)",
+                "Spotify rate limit hit: paused for {} ({method} {path} returned 429{unsaved})",
                 human_wait(secs)
             );
         }
@@ -689,6 +727,49 @@ mod tests {
         // The mock server is gone; a real request would fail with a connection error.
         let second = api.devices().await.unwrap_err().to_string();
         assert!(second.contains("no requests for another"), "{second}");
+    }
+
+    /// A fresh path inside the temp dir; nothing exists there yet.
+    fn temp_cooldown_file(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("spotui-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("rate-limit")
+    }
+
+    #[tokio::test]
+    async fn rate_limit_survives_a_restart_and_a_second_process() {
+        let file = temp_cooldown_file("restart");
+        let (api, request) = serve_once(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3600\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let api = api.with_cooldown_file(file.clone());
+        api.devices().await.unwrap_err();
+        request.await.unwrap();
+        // A new Api has an empty in-memory cooldown, like a restarted spotui or a
+        // second spotui. The port is closed, so a real request would fail to connect.
+        let other = Api::with_base("tok".into(), "http://127.0.0.1:1".into())
+            .with_cooldown_file(file.clone());
+        let message = other.devices().await.unwrap_err().to_string();
+        assert!(message.contains("no requests for another"), "{message}");
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_or_unreadable_cooldown_files_do_not_block() {
+        for (name, contents) in [("expired", "1"), ("garbage", "soon"), ("empty", "")] {
+            let file = temp_cooldown_file(name);
+            std::fs::write(&file, contents).unwrap();
+            let (api, request) = serve_once(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 14\r\n\r\n{\"devices\":[]}",
+            )
+            .await;
+            let api = api.with_cooldown_file(file.clone());
+            assert!(api.devices().await.unwrap().is_empty(), "{name}");
+            request.await.unwrap();
+            std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]

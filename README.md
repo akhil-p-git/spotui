@@ -175,6 +175,7 @@ spotui whoami                  # show the logged-in account
 - An artist page shows "top matches", not a top-tracks list. Spotify removed its top-tracks endpoint and the `popularity` field in February 2026, so spotui searches for the artist's name and keeps tracks by that artist, in Spotify's relevance order. Albums and singles come from Spotify's artist-albums endpoint, 10 per page, and load more as you scroll.
 - Search returns at most 10 artists and 10 tracks. Spotify caps `limit` at 10 for Development Mode apps.
 - Spotify lists the tracks of a playlist only if you own it or collaborate on it. For any other playlist spotui shows an explanation instead. Pressing `P` on one asks Spotify to play it; whether Spotify allows that for playlists you only follow has not been tested.
+- When Spotify answers 429, spotui stops calling it until the `Retry-After` time has passed and saves that deadline in `~/.config/spotui/rate-limit`. Restarting spotui, running a CLI command, or starting a second spotui on the same machine all wait it out; a second machine has its own file and does not. Every machine that uses the same Client ID still shares one Spotify quota.
 - The track count in the playlist list can lag behind a change you just made. Opening the playlist shows the real contents.
 - spotui cannot rename, reorder or delete playlists.
 
